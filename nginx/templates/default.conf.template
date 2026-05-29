@@ -1,0 +1,107 @@
+# ===========================================================================
+# SPASA Video Restreamer — nginx mTLS reverse proxy (Phase 1 infra "B")
+# ===========================================================================
+# This file is processed by the nginx image entrypoint with envsubst. Only the
+# variables named in NGINX_ENVSUBST_FILTER (see docker-compose.yml) are
+# substituted — nginx runtime variables ($ssl_client_verify, $host, ...) are
+# left untouched. Substituted here: ${PROXY_SHARED_SECRET}, ${METRICS_ALLOW_CIDR}.
+#
+# Role: terminate TLS 1.2/1.3 with mutual auth against the SPASA PKI, then pass
+# the verified client identity to the Flask app over the internal docker network.
+# The app trusts the X-SSL-Client-* headers only because it also receives the
+# shared secret X-Proxy-Auth, which never leaves this proxy.
+
+# --- WebSocket upgrade mapping (SocketIO) ---
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+# --- Derive the client-cert CN from the RFC2253 subject DN ---
+# nginx exposes the full DN ($ssl_client_s_dn) but not the CN directly.
+map $ssl_client_s_dn $ssl_client_cn {
+    default        "";
+    ~CN=([^,]+)    $1;
+}
+
+# --- Rate-limit zones ---
+limit_req_zone $binary_remote_addr zone=api:10m   rate=20r/s;   # general API
+limit_req_zone $binary_remote_addr zone=login:10m rate=5r/m;    # login (matches app)
+
+upstream media_app {
+    server media:3000;
+    keepalive 16;
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name _;
+
+    server_tokens off;
+
+    # --- TLS termination (FIPS-ready cipher suite; TLS 1.3 uses its own AEAD set) ---
+    ssl_certificate     /etc/nginx/pki/server.crt;
+    ssl_certificate_key /etc/nginx/pki/server.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256;
+    ssl_prefer_server_ciphers on;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 10m;
+
+    # --- Mutual TLS against the SPASA PKI ---
+    # Drop in the real SPASA CA + CRL at deploy time (mounted read-only). For local
+    # testing, nginx/pki/gen-dev-pki.sh produces a throwaway CA + client certs.
+    ssl_client_certificate /etc/nginx/pki/ca.crt;
+    ssl_crl                /etc/nginx/pki/crl.pem;
+    ssl_verify_client      on;     # reject any client without a valid, unrevoked cert
+    ssl_verify_depth       2;      # adjust to the SPASA PKI hierarchy depth
+
+    # --- Trusted identity headers (ALWAYS set by us → override any client value) ---
+    proxy_set_header X-SSL-Client-Verify $ssl_client_verify;
+    proxy_set_header X-SSL-Client-CN     $ssl_client_cn;
+    proxy_set_header X-SSL-Client-DN     $ssl_client_s_dn;
+    proxy_set_header X-Proxy-Auth        "${PROXY_SHARED_SECRET}";
+    proxy_set_header X-Forwarded-Proto   https;
+    proxy_set_header X-Forwarded-For     $proxy_add_x_forwarded_for;
+    proxy_set_header X-Real-IP           $remote_addr;
+    proxy_set_header Host                $host;
+
+    # Generous cap for recording uploads / cert uploads (matches Flask MAX_CONTENT_LENGTH).
+    client_max_body_size 512m;
+
+    # --- WebSocket (SocketIO) ---
+    location /socket.io/ {
+        proxy_pass http://media_app;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_read_timeout 3600s;
+    }
+
+    # --- Login: strict rate limit ---
+    location = /api/auth/login {
+        limit_req zone=login burst=5 nodelay;
+        proxy_pass http://media_app;
+    }
+
+    # --- Prometheus metrics: restrict to the monitoring subnet at the edge ---
+    # /metrics sits outside the app auth gate; lock it down here.
+    location = /metrics {
+        allow ${METRICS_ALLOW_CIDR};
+        deny  all;
+        proxy_pass http://media_app;
+    }
+
+    # --- Everything else (UI, /api/*, /hls/*) ---
+    location / {
+        limit_req zone=api burst=40 nodelay;
+        proxy_pass http://media_app;
+    }
+
+    # --- Forward-looking (Phase 3 data-plane): serve /hls/ and recording downloads
+    # directly from nginx via X-Accel-Redirect to offload the app. Left as a hook;
+    # HLS is currently served (fail-closed) by Flask.
+    # location /internal-hls/ { internal; alias /opt/app/hls/; }
+}

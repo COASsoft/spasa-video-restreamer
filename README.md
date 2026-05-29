@@ -65,6 +65,86 @@ Other hardening recommendations:
 
 To report a security vulnerability, please open a private security advisory on GitHub rather than a public issue.
 
+## mTLS Edge + RBAC (hardened deployment)
+
+For high-security deployments the stack runs behind an **nginx reverse proxy** (`proxy`
+service) that terminates TLS 1.2/1.3 and enforces **mutual TLS** against your PKI (e.g.
+the SPASA/TAK enterprise CA). nginx is the only host-published HTTP entrypoint (port
+443); the Flask app (`:3000`) and MediaMTX HLS (`:8888`) are reachable only over the
+private `edge` network. The proxy passes the verified client identity to the app as
+`X-SSL-Client-CN`/`-DN`/`-Verify`, which the app trusts **only** because the proxy also
+sends a shared secret (`X-Proxy-Auth`) that never leaves the proxy.
+
+**Roles (RBAC):** `admin` > `operator` > `viewer`, enforced by a centralized table in
+the app. Reads → viewer; stream/recording/test/transcode mutations → operator;
+key/settings/TLS management → admin. Identity comes from (in precedence) a session,
+an mTLS client cert, an API key, or Basic auth. API keys are role-scoped
+(`POST /api/auth/keys {"name","role"}`).
+
+**Cert → role mapping** lives in `data/cert_roles.json` (git-ignored):
+
+```json
+{ "cn_roles": {"admin-dev": "admin", "operator-dev": "operator", "viewer-dev": "viewer"},
+  "dn_roles": {},
+  "default_role": null }
+```
+
+`default_role: null` is **fail-closed**: a valid cert whose CN/DN is unmapped gets no
+role (denied). Set it to `"viewer"` (or `CERT_DEFAULT_ROLE=viewer`) only once per-feed
+authorization is delegated elsewhere.
+
+**HLS is fail-closed** (`HLS_REQUIRE_AUTH=true`): playback requires an authenticated
+identity OR a short-lived HMAC-signed URL. Issue one for credential-less embeds with
+`GET /api/streams/<name>/hls-token` (returns `player_url`/`master_url`/`proxy_url` with
+`?exp=&sig=`, TTL `HLS_URL_TTL`).
+
+### Configuration (set in a local `.env`, never committed)
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `PROXY_SHARED_SECRET` | `proxy-shared-change-me` | Shared secret between nginx and the app; gates trust of the `X-SSL-Client-*` headers. **Must match** on both services. |
+| `MTLS_ENABLED` | `true` | App honours mTLS identity headers (requires `PROXY_SHARED_SECRET`). |
+| `CERT_DEFAULT_ROLE` | _(unset = deny)_ | Fallback role for an unmapped cert. |
+| `HLS_REQUIRE_AUTH` | `true` | Fail-closed HLS playback. |
+| `HLS_URL_TTL` | `3600` | TTL (s) for signed HLS URLs. |
+| `MEDIAMTX_API_PASS` | `mediamtx-change-me` | Control-API password; also injected into MediaMTX (`MTX_AUTHINTERNALUSERS_0_PASS`). |
+| `VPN_CIDR` | `10.0.0.0/8` | CIDR allowed to publish to MediaMTX without credentials (drones/ATAK). |
+| `METRICS_ALLOW_CIDR` | `127.0.0.1/32` | Subnet allowed to scrape `/metrics` at the edge. |
+
+> **Rollout order:** the app-side MediaMTX credentials and the MediaMTX API lockdown
+> ship together — deploy both at once (matching `MEDIAMTX_API_PASS`) so the in-process
+> client can still reach the control API.
+
+### PKI
+
+Production: drop the real PKI material into `nginx/pki/` (git-ignored), read-only:
+`ca.crt` (issuing CA), `crl.pem` (revocation list), and `server.crt`/`server.key` (this
+proxy's TLS cert). For local testing, generate a throwaway PKI:
+
+```bash
+./nginx/pki/gen-dev-pki.sh                 # CA + server cert + admin/operator/viewer client certs + empty CRL
+# map the dev client CNs to roles:
+cat > data/cert_roles.json <<'EOF'
+{"cn_roles":{"admin-dev":"admin","operator-dev":"operator","viewer-dev":"viewer"},"dn_roles":{},"default_role":null}
+EOF
+docker compose up -d
+```
+
+### Validate the handshake
+
+```bash
+# Authorized client cert → 200 (role from the cert CN)
+curl --cert nginx/pki/admin.crt --key nginx/pki/admin.key --cacert nginx/pki/ca.crt https://localhost/api/streams
+# No client cert → rejected at the TLS layer (400/handshake failure)
+curl --cacert nginx/pki/ca.crt https://localhost/api/streams
+# viewer cert POSTing a mutation → 403 (RBAC)
+curl --cert nginx/pki/viewer.crt --key nginx/pki/viewer.key --cacert nginx/pki/ca.crt -X POST https://localhost/api/streams/foo
+```
+
+> Rate limiting is enforced at the edge (`/api/auth/login` 5/min, general API 20/s) in
+> addition to the app's own login limiter. Revoke a cert by adding it to the CRL and
+> `docker compose restart proxy` (see `nginx/pki/gen-dev-pki.sh` for the revoke recipe).
+
 ----
 
 ## Features
