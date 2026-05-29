@@ -19,24 +19,141 @@ import re
 from pathlib import Path
 import logging
 
-from app.config import STREAMS_DIR, SHARED_VIDEOS_DIR
+from app.config import STREAMS_DIR, SHARED_VIDEOS_DIR, FFMPEG_LOG_DIR
 from app.state import active_recordings, thumbnail_executor, post_processing_queue, recording_lock
 from app.api.settings import server_settings
 from app.utils.codec_detection import detect_stream_codec, analyze_recording
 from app.utils.thumbnail import generate_thumbnail
+from app.utils.validation import is_valid_stream_name
+from app.services.process import ManagedProcess
 from app.websocket.broadcast import broadcast
 
 logger = logging.getLogger(__name__)
 
 recordings_bp = Blueprint('recordings', __name__)
 
-# Stream name validation regex - only safe characters
-STREAM_NAME_PATTERN = re.compile(r'^[a-zA-Z0-9_-]+$')
 
+def _streams_free_gb() -> float:
+    """Free space (GB) on the recordings volume; -1.0 if it can't be determined."""
+    try:
+        return shutil.disk_usage(STREAMS_DIR).free / (1024 ** 3)
+    except OSError:
+        return -1.0
+
+
+def begin_recording(stream_name, ffmpeg_args, recording_file, *, codec,
+                    timecode='00:00:00:00', timecode_metadata='', has_data=False,
+                    auto_started=False, start_dt=None):
+    """Spawn the recording FFmpeg via the supervisor and track it consistently.
+
+    Shared by the manual record endpoint and the auto-record monitor so both
+    produce the SAME ``active_recordings`` schema and lifecycle (this fixes the
+    earlier divergence where auto-records could not be stopped). Returns the
+    ManagedProcess, or None if FFmpeg failed to start.
+
+    stdin_pipe=True lets stop send FFmpeg 'q' to finalise the MOV moov atom;
+    stderr is captured to a log file (no PIPE buffer to deadlock on).
+    """
+    if start_dt is None:
+        start_dt = datetime.now(timezone.utc)
+
+    # Fail closed on a (near-)full disk: don't start a recording we can't write.
+    min_free_gb = server_settings.get('min_free_space_gb', 10)
+    free_gb = _streams_free_gb()
+    if free_gb >= 0 and free_gb < min_free_gb:
+        logger.error(f"Refusing to start recording for {stream_name}: only "
+                     f"{free_gb:.1f}GB free (< {min_free_gb}GB minimum)")
+        broadcast('recording_disk_full',
+                  {'name': stream_name, 'free_gb': round(free_gb, 2),
+                   'min_free_gb': min_free_gb})
+        return None
+
+    proc = ManagedProcess(f'rec-{stream_name}', ffmpeg_args, FFMPEG_LOG_DIR,
+                          label=f'rec:{stream_name}', stdin_pipe=True)
+    if not proc.start():
+        return None
+
+    with recording_lock:
+        active_recordings[stream_name] = {
+            'process': proc,
+            'file': recording_file,
+            'startTime': start_dt,
+            'pid': proc.pid,
+            'timecode': timecode,
+            'timecodeMetadata': timecode_metadata,
+            'codec': codec,
+            'auto_started': auto_started,
+        }
+
+    def _monitor_exit():
+        proc.wait()
+        duration = int((datetime.now(timezone.utc) - start_dt).total_seconds())
+        rc = proc.returncode
+        tail = proc.tail_stderr()
+        if rc not in (0, None):
+            logger.error(f"FFmpeg exited rc={rc} for {stream_name} after {duration}s; "
+                         f"stderr tail: {' / '.join(tail[-8:])}")
+        else:
+            logger.info(f"FFmpeg completed for {stream_name} after {duration}s")
+            thumbnail_executor.submit(generate_thumbnail, recording_file, stream_name)
+        # Race-safe auto-cleanup: only drop the entry if it's still THIS process
+        # (stop_recording may have already popped it).
+        with recording_lock:
+            cur = active_recordings.get(stream_name)
+            if cur is not None and cur.get('process') is proc:
+                del active_recordings[stream_name]
+        # Release the stderr log FD now that the process is gone (stop() was not
+        # necessarily called on a natural exit).
+        proc.close()
+
+    threading.Thread(target=_monitor_exit, daemon=True, name=f'rec-mon-{stream_name}').start()
+
+    max_size_gb = server_settings.get('max_file_size_gb', 10)
+
+    def _monitor_size():
+        max_bytes = max_size_gb * (1024 ** 3)
+        stream_dir = os.path.dirname(recording_file)
+        while proc.poll() is None:
+            time.sleep(10)
+            try:
+                # Stop early if the disk is running out, before a write fails.
+                min_free_gb = server_settings.get('min_free_space_gb', 10)
+                free_gb = _streams_free_gb()
+                if free_gb >= 0 and free_gb < min_free_gb:
+                    logger.warning(f"Recording {stream_name} stopping: only "
+                                   f"{free_gb:.1f}GB free (< {min_free_gb}GB minimum)")
+                    if not proc.request_graceful_quit():
+                        proc.terminate()
+                    broadcast('recording_low_space',
+                              {'name': stream_name, 'free_gb': round(free_gb, 2),
+                               'min_free_gb': min_free_gb})
+                    break
+                if server_settings.get('segmented_recording', False):
+                    total = sum(f.stat().st_size for f in Path(stream_dir).glob('recording-*.mov'))
+                else:
+                    total = os.path.getsize(recording_file) if os.path.exists(recording_file) else 0
+                if total >= max_bytes:
+                    logger.warning(f"Recording {stream_name} reached {total/(1024**3):.1f}GB "
+                                   f"limit ({max_size_gb}GB), stopping")
+                    if not proc.request_graceful_quit():
+                        proc.terminate()
+                    broadcast('recording_size_limit',
+                              {'name': stream_name, 'size_gb': round(total/(1024**3), 2)})
+                    break
+            except Exception:
+                pass
+
+    threading.Thread(target=_monitor_size, daemon=True, name=f'rec-size-{stream_name}').start()
+
+    broadcast('recording_started', {
+        'name': stream_name, 'file': recording_file, 'timecode': timecode,
+        'hasKlv': has_data, 'auto_started': auto_started,
+    })
+    return proc
 
 def validate_stream_name(stream_name: str) -> bool:
-    """Validate stream name contains only safe characters"""
-    return bool(STREAM_NAME_PATTERN.match(stream_name)) and len(stream_name) <= 64
+    """Validate stream name contains only safe characters (centralized rules)."""
+    return is_valid_stream_name(stream_name)
 
 
 def validate_filename(filename: str) -> bool:
@@ -262,91 +379,23 @@ def start_recording(stream_name):
         
         logger.info(f"Starting recording: {stream_name} -> {Path(recording_file).name} TC={timecode_ffmpeg}")
         
-        # Start FFmpeg process
-        process = subprocess.Popen(
-            ffmpeg_args,
-            stdin=subprocess.PIPE,  # Allow sending 'q' for graceful shutdown
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
+        # Start FFmpeg via the unified supervisor: stderr->file (no PIPE deadlock),
+        # graceful 'q' quit on stop, consistent tracking + monitor threads. Shared
+        # with auto-record so the two paths can't diverge.
+        proc = begin_recording(
+            stream_name, ffmpeg_args, recording_file,
+            codec=stream_info['codec'],
+            timecode=timecode_ffmpeg,
+            timecode_metadata=timecode_metadata,
+            has_data=stream_info.get('has_data', False),
+            auto_started=False,
+            start_dt=now,
         )
-        
-        # Store recording info
-        active_recordings[stream_name] = {
-            'process': process,
-            'file': recording_file,
-            'startTime': now,
-            'pid': process.pid,
-            'timecode': timecode_ffmpeg,
-            'timecodeMetadata': timecode_metadata,
-            'codec': stream_info['codec']
-        }
-        
-        # Start thread to monitor FFmpeg output
-        def monitor_ffmpeg():
-            stderr_output = []
-            for line in process.stderr:
-                stderr_output.append(line.decode('utf-8', errors='ignore'))
-            
-            return_code = process.wait()
-            duration = int((datetime.now(timezone.utc) - now).total_seconds())
-            
-            if return_code != 0:
-                logger.error(f"FFmpeg exited with code {return_code} for {stream_name} after {duration}s")
-                logger.error(f"FFmpeg stderr: {''.join(stderr_output[-20:])}")
-            else:
-                logger.info(f"FFmpeg completed successfully for {stream_name} after {duration}s")
-                # Log last few lines of stderr to understand why it stopped
-                if stderr_output:
-                    logger.info(f"FFmpeg final output: {''.join(stderr_output[-10:])}")
-                # Generate thumbnail using thread pool executor
-                thumbnail_executor.submit(generate_thumbnail, recording_file, stream_name)
-            
-            # Clean up only if not already stopped by user
-            # The stop endpoint will handle cleanup properly
-            if stream_name in active_recordings:
-                recording = active_recordings[stream_name]
-                # Only auto-cleanup if process exited on its own (not terminated by user)
-                if recording.get('process') and recording['process'].poll() is not None:
-                    logger.info(f"Auto-cleanup recording for {stream_name} (FFmpeg exited)")
-                    del active_recordings[stream_name]
-        
-        threading.Thread(target=monitor_ffmpeg, daemon=True).start()
+        if proc is None:
+            with recording_lock:
+                active_recordings.pop(stream_name, None)
+            return jsonify({'error': 'Failed to start FFmpeg recording process'}), 500
 
-        # Start file size monitor thread if max_file_size_gb is configured
-        max_size_gb = server_settings.get('max_file_size_gb', 10)
-        def monitor_file_size():
-            max_bytes = max_size_gb * (1024 ** 3)
-            while process.poll() is None:
-                time.sleep(10)
-                try:
-                    # For segmented recording, check total size of all segments
-                    if server_settings.get('segmented_recording', False):
-                        total = sum(
-                            f.stat().st_size for f in Path(stream_dir).glob(f'recording-{timestamp}-*.mov')
-                        )
-                    else:
-                        total = os.path.getsize(recording_file) if os.path.exists(recording_file) else 0
-                    if total >= max_bytes:
-                        logger.warning(f"Recording {stream_name} reached {total / (1024**3):.1f}GB limit ({max_size_gb}GB), stopping")
-                        try:
-                            process.stdin.write(b'q')
-                            process.stdin.flush()
-                        except Exception:
-                            process.terminate()
-                        broadcast('recording_size_limit', {'name': stream_name, 'size_gb': round(total / (1024**3), 2)})
-                        break
-                except Exception:
-                    pass
-
-        threading.Thread(target=monitor_file_size, daemon=True).start()
-        
-        broadcast('recording_started', {
-            'name': stream_name,
-            'file': recording_file,
-            'timecode': timecode_ffmpeg,
-            'hasKlv': stream_info.get('has_data', False)
-        })
-        
         return jsonify({
             'success': True,
             'message': f'Recording started for {stream_name}',
@@ -367,30 +416,32 @@ def stop_recording(stream_name):
     """Stop recording a stream"""
     
     try:
-        if stream_name not in active_recordings:
-            # May have already stopped via monitor thread
+        # Atomically claim the recording (race-safe vs the monitor auto-cleanup
+        # thread, which previously caused a double-delete / "partial cleanup").
+        with recording_lock:
+            recording = active_recordings.pop(stream_name, None)
+        if recording is None:
             logger.warning(f"Stream {stream_name} is not in active recordings (may have already stopped)")
             return jsonify({
                 'success': True,
                 'message': f'Recording already stopped for {stream_name}'
             })
-        
-        recording = active_recordings[stream_name]
-        process = recording['process']
-        recording_file = recording['file']
-        start_time = recording['startTime']
-        
+
+        process = recording.get('process')
+        recording_file = recording.get('file')
+        start_time = recording.get('startTime', datetime.now(timezone.utc))
+
+        # If only the slot was reserved (codec detection still in flight) there is
+        # no process/file to finalise.
+        if process is None or recording_file is None:
+            return jsonify({'success': True, 'message': f'Recording stopped for {stream_name}'})
+
         # Check if process is still running
         if process.poll() is None:
-            # Process still running - send 'q' for graceful quit to ensure moov atom is written
+            # Send FFmpeg 'q' for a graceful quit so the MOV moov atom is written.
             logger.info(f"Sending graceful quit signal to FFmpeg for {stream_name}")
-            try:
-                process.stdin.write(b'q')
-                process.stdin.flush()
-                process.stdin.close()
-            except Exception as e:
-                logger.warning(f"Could not send quit signal: {e}")
-            
+            if not process.request_graceful_quit():
+                process.terminate()
             try:
                 # Give FFmpeg time to finish writing properly
                 process.wait(timeout=10)
@@ -402,18 +453,14 @@ def stop_recording(stream_name):
                     process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     logger.warning(f"FFmpeg didn't terminate, forcing kill for {stream_name}")
-                    process.kill()
-                    process.wait()
+                    process.kill()  # fire-and-forget; do not wait() (D-state safe)
         else:
             logger.info(f"FFmpeg already exited for {stream_name} (code: {process.returncode})")
-        
+
         # Calculate duration
         duration = int((datetime.now(timezone.utc) - start_time).total_seconds())
-        
+
         logger.info(f"Recording stopped: {stream_name}, duration: {duration}s")
-        
-        # Clean up active recordings FIRST to prevent duplicate stops
-        del active_recordings[stream_name]
         
         # Analyze recording if file exists
         analysis = None

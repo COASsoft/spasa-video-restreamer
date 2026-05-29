@@ -6,44 +6,214 @@ This program is free software: you can redistribute it and/or modify it under th
 This is distributed in the hope that it will be useful, but without any warranty, without even the implied warranty of merchantability or fitness for a particular purpose.  See the GNU General Public License for more details. https://www.gnu.org/licenses/
 
 Application configuration and settings
+
+All environment variables are read and validated here. ``validate_runtime_config()``
+is called once at app startup (create_app) and fails closed on insecure
+configuration (e.g. the default admin password in a non-dev deployment).
 """
 import os
 import sys
 import secrets
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Typed environment helpers — parse + validate, fail fast with clear messages
+# ---------------------------------------------------------------------------
+
+class ConfigError(RuntimeError):
+    """Raised when configuration is invalid or insecure."""
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw == '':
+        return default
+    return raw.strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _env_int(name: str, default: int, *, minimum: int = None, maximum: int = None) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == '':
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise ConfigError(f"{name} must be an integer, got {raw!r}")
+    if minimum is not None and value < minimum:
+        raise ConfigError(f"{name} must be >= {minimum}, got {value}")
+    if maximum is not None and value > maximum:
+        raise ConfigError(f"{name} must be <= {maximum}, got {value}")
+    return value
+
+
+# ---------------------------------------------------------------------------
+# Deployment mode flags (control fail-closed behaviour)
+# ---------------------------------------------------------------------------
+# DEV_MODE relaxes production safety checks (default password, etc.). It must
+# never be enabled in a fielded/military deployment.
+DEV_MODE = _env_bool('DEV_MODE', False)
+# Explicit, narrow override to permit the default admin password even outside
+# DEV_MODE (e.g. a throwaway lab). Off by default — production is fail-closed.
+ALLOW_DEFAULT_PASSWORD = _env_bool('ALLOW_DEFAULT_PASSWORD', False)
 
 # Flask Configuration
-PORT = int(os.environ.get('PORT', 3000))
+PORT = _env_int('PORT', 3000, minimum=1, maximum=65535)
 
-# Generate secure secret key if not provided
-_env_secret = os.environ.get('SECRET_KEY', '')
-if _env_secret and _env_secret != 'dev-secret-key-change-in-production':
-    SECRET_KEY = _env_secret
-else:
-    # Generate cryptographically secure random key
-    SECRET_KEY = secrets.token_hex(32)
-    if not os.environ.get('SECRET_KEY'):
-        print("WARNING: No SECRET_KEY set in environment. Using generated random key (sessions won't persist across restarts).")
+# Directory Configuration (defined before SECRET_KEY so the key can be persisted)
+STREAMS_DIR = os.environ.get('STREAMS_DIR', '/opt/app/streams')
+# Places a copy of recordings in a shared volume.
+SHARED_VIDEOS_DIR = os.environ.get('SHARED_VIDEOS_DIR', '/opt/app/shared_videos')
+LOGS_DIR = os.environ.get('LOGS_DIR', '/opt/app/logs')
+# Per-process FFmpeg stderr logs (shared by recordings/test/abr/srt). Centralized
+# here so every spawn site captures stderr to the same place.
+FFMPEG_LOG_DIR = os.environ.get('FFMPEG_LOG_DIR', os.path.join(LOGS_DIR, 'ffmpeg'))
+DATA_DIR = os.environ.get('DATA_DIR', '/opt/app/data')
+CERTS_DIR = os.environ.get('CERTS_DIR', os.path.join(STREAMS_DIR, '.certs'))
+EXTERNAL_CERTS_DIR = os.environ.get('EXTERNAL_CERTS_DIR', '/opt/app/external-certs')
+ACTIVE_CERTS_DIR = os.environ.get('ACTIVE_CERTS_DIR', '/opt/app/certs')
+
+# Path to the persisted auto-generated secret key (used only when SECRET_KEY
+# is not supplied via the environment).
+_SECRET_KEY_FILE = os.path.join(DATA_DIR, 'secret_key')
+
+
+def _resolve_secret_key() -> str:
+    """Resolve the Flask session secret.
+
+    Priority: explicit env ``SECRET_KEY`` > persisted key file > freshly
+    generated key (persisted with 0600 perms). Persisting the generated key
+    keeps sessions valid across restarts and consistent across workers, instead
+    of silently invalidating every session on each boot.
+    """
+    env_secret = os.environ.get('SECRET_KEY', '')
+    if env_secret and env_secret != 'dev-secret-key-change-in-production':
+        return env_secret
+
+    try:
+        if os.path.isfile(_SECRET_KEY_FILE):
+            with open(_SECRET_KEY_FILE, 'r') as f:
+                existing = f.read().strip()
+            if existing:
+                return existing
+    except OSError as e:
+        print(f"WARNING: could not read persisted SECRET_KEY ({e}); generating a new one.")
+
+    generated = secrets.token_hex(32)
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        # O_CREAT|O_EXCL-style write with restrictive perms from the start.
+        fd = os.open(_SECRET_KEY_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w') as f:
+            f.write(generated)
+    except OSError as e:
+        print(f"WARNING: could not persist SECRET_KEY to {_SECRET_KEY_FILE} ({e}); "
+              "sessions will not survive a restart. Set SECRET_KEY in the environment.")
+    return generated
+
+
+SECRET_KEY = _resolve_secret_key()
 
 # MediaMTX Configuration
 # Use 127.0.0.1 (not 'localhost') to avoid IPv6 resolution on Windows
 MEDIAMTX_API_URL = os.environ.get('MEDIAMTX_API_URL', 'http://127.0.0.1:8889')
 MEDIAMTX_RTSP_URL = os.environ.get('MEDIAMTX_RTSP_URL', 'rtsp://127.0.0.1:8554')
 
-# Directory Configuration
-STREAMS_DIR = os.environ.get('STREAMS_DIR', '/opt/app/streams')
-# Places a copy of recordings in a shared volume.
-SHARED_VIDEOS_DIR = os.environ.get('SHARED_VIDEOS_DIR', '/opt/app/shared_videos')
-LOGS_DIR = os.environ.get('LOGS_DIR', '/opt/app/logs')
-DATA_DIR = os.environ.get('DATA_DIR', '/opt/app/data')
-CERTS_DIR = os.environ.get('CERTS_DIR', os.path.join(STREAMS_DIR, '.certs'))
-EXTERNAL_CERTS_DIR = os.environ.get('EXTERNAL_CERTS_DIR', '/opt/app/external-certs')
-ACTIVE_CERTS_DIR = os.environ.get('ACTIVE_CERTS_DIR', '/opt/app/certs')
+# Optional credentials the app uses to authenticate to the MediaMTX control API.
+# Unset = no auth (back-compat with an open localhost-bound API). Set these once the
+# MediaMTX API requires credentials (Phase 1 infra "B"): a token takes precedence over
+# user/pass and is sent as a Bearer header; user/pass is sent as HTTP Basic.
+MEDIAMTX_API_USER = os.environ.get('MEDIAMTX_API_USER', '')
+MEDIAMTX_API_PASS = os.environ.get('MEDIAMTX_API_PASS', '')
+MEDIAMTX_API_TOKEN = os.environ.get('MEDIAMTX_API_TOKEN', '')
+
+
+def _mediamtx_auth_kwargs() -> dict:
+    """requests kwargs (auth=/headers=) for authenticating to the MediaMTX API.
+    Empty when no credentials are configured (open-API back-compat). Reused by the
+    few ad-hoc ``requests.get(MEDIAMTX_API_URL/v3/...)`` call sites outside the client."""
+    if MEDIAMTX_API_TOKEN:
+        return {'headers': {'Authorization': f'Bearer {MEDIAMTX_API_TOKEN}'}}
+    if MEDIAMTX_API_USER:
+        return {'auth': (MEDIAMTX_API_USER, MEDIAMTX_API_PASS)}
+    return {}
+
+
+# Ready-made requests kwargs for ad-hoc MediaMTX API calls (see direct call sites).
+MEDIAMTX_API_AUTH = _mediamtx_auth_kwargs()
 
 # CORS Configuration
 CORS_ORIGINS = os.environ.get('CORS_ORIGINS', '*')
 
+# Optional bearer token gating the /metrics endpoint. /metrics sits OUTSIDE the
+# /api auth gate (Prometheus-style root path), so when this is unset it is
+# reachable without auth — acceptable for the VPN-only deployment. Set it (or
+# restrict /metrics at the nginx edge) to lock the endpoint down.
+METRICS_TOKEN = os.environ.get('METRICS_TOKEN', '')
+
+# ---------------------------------------------------------------------------
+# mTLS / RBAC (Phase 1 infra "B")
+# ---------------------------------------------------------------------------
+# Role names are duplicated here as literals (instead of importing app.auth) to
+# avoid an import cycle: app.auth imports from app.config, never the reverse.
+_VALID_ROLES = ('viewer', 'operator', 'admin')
+
+# When True, the app honours mTLS client-cert identity injected by the trusted
+# reverse proxy (nginx). The X-SSL-Client-* headers are trusted ONLY when the
+# request also carries a matching PROXY_SHARED_SECRET (anti-spoof), so this is
+# safe even on a shared docker network.
+MTLS_ENABLED = _env_bool('MTLS_ENABLED', False)
+# Shared secret nginx sends as X-Proxy-Auth. Required when MTLS_ENABLED (the app
+# refuses to start otherwise — see validate_runtime_config). Without it, no
+# X-SSL-Client-* header is ever honoured.
+PROXY_SHARED_SECRET = os.environ.get('PROXY_SHARED_SECRET', '')
+# cert CN/DN → role map (atomic JSON). Schema:
+#   {"cn_roles": {<cn>: <role>}, "dn_roles": {<dn>: <role>}, "default_role": <role|null>}
+CERT_ROLE_MAP_FILE = os.environ.get('CERT_ROLE_MAP_FILE', os.path.join(DATA_DIR, 'cert_roles.json'))
+# Fallback role for an authenticated-but-unmapped client cert when the map file
+# omits "default_role". None = fail-closed (no implicit role → denied). Military
+# default: every identity must be explicitly granted a role. Flip to 'viewer'
+# only once SPASA's per-feed GroupVector/classification ACL is wired in.
+CERT_DEFAULT_ROLE = os.environ.get('CERT_DEFAULT_ROLE') or None
+# Role granted to legacy API keys that predate role-aware keys (no "role" field).
+API_KEY_DEFAULT_ROLE = os.environ.get('API_KEY_DEFAULT_ROLE', 'viewer')
+
+# ---------------------------------------------------------------------------
+# HLS access control (Phase 1 infra "B")
+# ---------------------------------------------------------------------------
+# When True, HLS playback is fail-closed: each HLS view requires either an
+# authenticated session/API-key/mTLS identity, OR a valid unexpired HMAC-signed
+# URL (?exp=&sig=). Default ON; the in-browser player carries the session cookie.
+HLS_REQUIRE_AUTH = _env_bool('HLS_REQUIRE_AUTH', True)
+# TTL (seconds) for signed HLS URLs issued by /api/streams/<name>/hls-token.
+HLS_URL_TTL = _env_int('HLS_URL_TTL', 3600, minimum=60, maximum=86400)
+# When True, HLS *segments* are served by nginx via X-Accel-Redirect (the app still
+# makes the fail-closed authz decision, but the bytes never pass through Python).
+# Requires the nginx /_hls_internal/ location + a read-only HLS mount in the proxy.
+# Default OFF so direct runs (dev/rig/tests, no nginx) serve segments from disk.
+HLS_X_ACCEL = _env_bool('HLS_X_ACCEL', False)
+# Internal location prefix nginx maps back to the HLS dir (see nginx template).
+HLS_X_ACCEL_PREFIX = os.environ.get('HLS_X_ACCEL_PREFIX', '/_hls_internal')
+
+# ---------------------------------------------------------------------------
+# Observability (Fase 4)
+# ---------------------------------------------------------------------------
+# Emit logs as structured JSON (one object per line) with a correlation id.
+# Default OFF (human-readable in dev); the container turns it on.
+LOG_JSON = _env_bool('LOG_JSON', False)
+# Optional syslog/SIEM sink for the tamper-evident audit trail. When AUDIT_SYSLOG_HOST
+# is set, each audit record is also shipped to syslog (append-only off-box = the real
+# anti-tamper control). Unset = local file only (back-compat).
+AUDIT_SYSLOG_HOST = os.environ.get('AUDIT_SYSLOG_HOST', '')
+AUDIT_SYSLOG_PORT = _env_int('AUDIT_SYSLOG_PORT', 514, minimum=1, maximum=65535)
+
 # Logging Configuration
-LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO')
+LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()
+_VALID_LOG_LEVELS = {'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'}
+if LOG_LEVEL not in _VALID_LOG_LEVELS:
+    LOG_LEVEL = 'INFO'
 LOG_MAX_BYTES = 10 * 1024 * 1024  # 10MB per file
 LOG_BACKUP_COUNT = 5  # Keep 5 backup files
 
@@ -66,8 +236,61 @@ except ImportError:
     print("Warning: SRT buffer module not available")
 
 # Pull Stream Configuration
-PULL_STREAM_BUFFER_SIZE = int(os.environ.get('PULL_STREAM_BUFFER_SIZE', 10485760))  # 10MB default buffer
-PULL_STREAM_MAX_DELAY = int(os.environ.get('PULL_STREAM_MAX_DELAY', 1000000))  # 1 second in microseconds (lower = less latency)
+PULL_STREAM_BUFFER_SIZE = _env_int('PULL_STREAM_BUFFER_SIZE', 10485760, minimum=0)  # 10MB default buffer
+PULL_STREAM_MAX_DELAY = _env_int('PULL_STREAM_MAX_DELAY', 1000000, minimum=0)  # 1s in microseconds
+
+
+# ---------------------------------------------------------------------------
+# Startup validation (fail-closed)
+# ---------------------------------------------------------------------------
+
+def validate_runtime_config() -> None:
+    """Validate security-critical configuration at startup.
+
+    Raises ConfigError (aborting startup) on insecure configuration. Called
+    once from create_app(). Override knobs (DEV_MODE / ALLOW_DEFAULT_PASSWORD)
+    exist for labs but default to the safe, fail-closed behaviour.
+    """
+    errors = []
+
+    admin_password = os.environ.get('ADMIN_PASSWORD', 'changeme')
+    if admin_password == 'changeme' and not (DEV_MODE or ALLOW_DEFAULT_PASSWORD):
+        errors.append(
+            "ADMIN_PASSWORD is the insecure default 'changeme'. Set a strong "
+            "ADMIN_PASSWORD. (For a non-production lab only, set DEV_MODE=true or "
+            "ALLOW_DEFAULT_PASSWORD=true to override.)"
+        )
+
+    # mTLS must not be enabled without the anti-spoof shared secret, or any
+    # process on the docker network could forge X-SSL-Client-* identity headers.
+    if MTLS_ENABLED and not PROXY_SHARED_SECRET and not DEV_MODE:
+        errors.append(
+            "MTLS_ENABLED is set but PROXY_SHARED_SECRET is empty. The shared "
+            "secret is required to trust the nginx-injected X-SSL-Client-* headers "
+            "(anti-spoof). Set PROXY_SHARED_SECRET."
+        )
+
+    # Role config must reference real roles, else access decisions are undefined.
+    if CERT_DEFAULT_ROLE is not None and CERT_DEFAULT_ROLE not in _VALID_ROLES:
+        errors.append(f"CERT_DEFAULT_ROLE invalid: {CERT_DEFAULT_ROLE!r} (expected one of {_VALID_ROLES} or unset).")
+    if API_KEY_DEFAULT_ROLE not in _VALID_ROLES:
+        errors.append(f"API_KEY_DEFAULT_ROLE invalid: {API_KEY_DEFAULT_ROLE!r} (expected one of {_VALID_ROLES}).")
+
+    if errors:
+        msg = "Insecure/invalid configuration — refusing to start:\n  - " + "\n  - ".join(errors)
+        logger.critical(msg)
+        raise ConfigError(msg)
+
+    # Non-fatal posture warnings (tightened further in later phases).
+    if CORS_ORIGINS == '*' and not DEV_MODE:
+        logger.warning("CORS_ORIGINS is '*' (all origins). Set an explicit allow-list for production.")
+    if not HLS_REQUIRE_AUTH and not DEV_MODE:
+        logger.warning("HLS_REQUIRE_AUTH is off — HLS playback is unauthenticated. Leave it on outside a lab.")
+    if MEDIAMTX_API_USER and not MEDIAMTX_API_PASS and not MEDIAMTX_API_TOKEN:
+        logger.warning("MEDIAMTX_API_USER is set without MEDIAMTX_API_PASS/TOKEN — MediaMTX API auth may fail.")
+    if PROXY_SHARED_SECRET and not MTLS_ENABLED:
+        logger.warning("PROXY_SHARED_SECRET is set but MTLS_ENABLED is off — mTLS identity headers will be ignored.")
+
 
 # Server Settings - Recording & Stream Management
 # Type schema for validation: maps each key to (type, min, max) or (type,) for no range check
@@ -106,30 +329,30 @@ SERVER_SETTINGS = {
     'auto_cleanup_enabled': False,
     'cleanup_days': 30,
     'min_free_space_gb': 10,
-    
+
     # Stream recovery settings
     'auto_reconnect': True,
     'reconnect_delay': 5,
     'max_reconnect_attempts': -1,  # -1 = unlimited
     'exponential_backoff': False,
     'max_backoff_delay': 60,
-    
+
     # Health monitoring
     'health_check_enabled': True,
     'stall_detection_enabled': True,
     'stall_threshold_seconds': 30,
-    
+
     # SRT buffering and recovery
     'srt_buffer_enabled': True,
     'srt_auto_reconnect': True,
     'srt_reconnect_delay': 2,
     'srt_max_buffer_seconds': 30,
-    
+
     # Network resilience
     'rtsp_transport': 'tcp',  # tcp or udp
     'connection_timeout': 5000000,  # microseconds
     'enable_ffmpeg_reconnect': True,
-    
+
     # Stream standby / persistence
     'standby_enabled': True,
     'standby_timeout_minutes': 60,  # 0 = never expire

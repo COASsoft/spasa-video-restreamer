@@ -10,7 +10,6 @@ SRT Stream Buffer & Recovery
 Continuously captures SRT stream, buffers it, and attempts reconnection on failure
 """
 import os
-import subprocess
 import threading
 import time
 import logging
@@ -99,45 +98,34 @@ class SRTStreamBuffer:
 
                 logger.info(f"Starting capture for {self.stream_name} (reconnect #{self.total_reconnects})")
 
-                # stderr goes to log file, NOT subprocess.PIPE.
-                # PIPE has a ~64KB OS buffer; FFmpeg progress output fills it
-                # within ~200s and blocks on write(), freezing the stream.
+                # Spawn under the shared supervisor: stderr is captured to a log
+                # file (a PIPE's ~64KB OS buffer fills with FFmpeg progress within
+                # ~200s and would deadlock the relay), the child runs in its own
+                # session for clean teardown, and it is tracked for startup orphan
+                # reconciliation. Imported lazily to avoid an import cycle
+                # (app.config imports this module while it is still initialising).
+                from app.services.process import ManagedProcess
                 log_dir = os.environ.get('FFMPEG_LOG_DIR', '/opt/app/logs/ffmpeg')
-                os.makedirs(log_dir, exist_ok=True)
-                log_path = os.path.join(log_dir, f'srt_{self.stream_name}.log')
-                stderr_file_obj = None
-                try:
-                    stderr_file_obj = open(log_path, 'w')
-                    stderr_target = stderr_file_obj
-                except OSError:
-                    stderr_target = subprocess.DEVNULL
+                mp = ManagedProcess(f'srt-{self.stream_name}', cmd, log_dir,
+                                    label=f'srt:{self.stream_name}')
+                if not mp.start():
+                    logger.error(f"Failed to start SRT capture for {self.stream_name}")
+                    if not self.is_running:
+                        break
+                    time.sleep(self.reconnect_delay)
+                    continue
+                self.process = mp
 
-                self.process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=stderr_target,
-                    bufsize=0
-                )
-
-                # Monitor the process
-                return_code = self.process.wait()
-
-                # Close log file
-                if stderr_file_obj is not None:
-                    stderr_file_obj.close()
+                # Wait for exit; stderr lives in the log file.
+                return_code = mp.wait()
+                stderr_tail = mp.tail_stderr(10)
+                mp.close()
 
                 # Log last lines of stderr on failure
-                if return_code != 0 and os.path.isfile(log_path):
-                    try:
-                        with open(log_path, 'r') as f:
-                            lines = f.readlines()
-                        tail = [l.rstrip() for l in lines[-10:] if l.strip()]
-                        if tail:
-                            logger.warning(f"SRT {self.stream_name} ffmpeg stderr (exit code {return_code}):")
-                            for line in tail:
-                                logger.warning(f"  ffmpeg[srt_{self.stream_name}]: {line}")
-                    except Exception:
-                        pass
+                if return_code not in (0, None) and stderr_tail:
+                    logger.warning(f"SRT {self.stream_name} ffmpeg stderr (exit code {return_code}):")
+                    for line in stderr_tail:
+                        logger.warning(f"  ffmpeg[srt:{self.stream_name}]: {line}")
 
                 if not self.is_running:
                     break

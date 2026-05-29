@@ -1,20 +1,59 @@
-version: '3.8'
+# Phase 1 infra "B": nginx terminates TLS + mutual-TLS at the edge (443) and is the
+# ONLY host-published HTTP entrypoint. The Flask app (:3000) and MediaMTX HLS (:8888)
+# are no longer published to the host — they are reachable only by the proxy over the
+# private 'edge' network. That isolation is what makes it safe for the app to trust
+# the X-SSL-Client-* identity headers (paired with the X-Proxy-Auth shared secret).
+#
+# Values like PROXY_SHARED_SECRET / MEDIAMTX_API_PASS / VPN_CIDR / METRICS_ALLOW_CIDR
+# come from a local .env file (see .env.example) — never commit real secrets.
 
 services:
+  proxy:
+    image: nginx:stable
+    container_name: tvr-proxy
+    depends_on:
+      - media
+    ports:
+      - "443:443"
+    volumes:
+      - ./nginx/templates:/etc/nginx/templates:ro
+      # PKI: drop the real SPASA ca.crt/crl.pem + a server.crt/server.key here at
+      # deploy time, or run nginx/pki/gen-dev-pki.sh for local testing. git-ignored.
+      - ./nginx/pki:/etc/nginx/pki:ro
+      # Read-only HLS dir so nginx can serve segments via X-Accel-Redirect (the app
+      # still makes the access decision). Must match the media service's HLS path.
+      - ./data/hls:/opt/app/hls:ro
+    environment:
+      # Only these names are substituted into the conf template; nginx's own
+      # $variables are left intact (see the template header).
+      - NGINX_ENVSUBST_FILTER=^(PROXY_SHARED_SECRET|METRICS_ALLOW_CIDR)$$
+      - PROXY_SHARED_SECRET=${PROXY_SHARED_SECRET:-proxy-shared-change-me}
+      - METRICS_ALLOW_CIDR=${METRICS_ALLOW_CIDR:-127.0.0.1/32}
+    restart: unless-stopped
+    networks:
+      - edge
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
   media:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: tak-video-restreamer
+    # NOTE: 3000 (Flask) and 8888 (MediaMTX HLS) are intentionally NOT published to
+    # the host — only the proxy reaches them. Media INGEST ports stay published so
+    # drones/cameras can publish directly.
+    expose:
+      - "3000"      # Flask Web UI (proxy-only)
     ports:
-      - "3000:3000"   # Flask Web UI
-      - "8554:8554"   # RTSP
-      - "8555:8555"   # RTSPS (RTSP over TLS)
-      - "1935:1935"       # RTMP
-      - "8890:8890/udp"   # SRT (UDP protocol)
-      - "8888:8888"   # HLS (HTTP Live Streaming)
-      - "127.0.0.1:8889:8889"   # MediaMTX API (localhost only for security)
-      # - "8889:8889"   # MediaMTX API (INSECURE - exposes to all interfaces. Uncomment only if needed for external access)
+      - "8554:8554"             # RTSP ingest
+      - "8555:8555"             # RTSPS ingest (RTSP over TLS)
+      - "1935:1935"             # RTMP ingest (drop if unused)
+      - "8890:8890/udp"         # SRT ingest (UDP)
+      - "127.0.0.1:8889:8889"   # MediaMTX control API (loopback only)
     volumes:
       - ./mediaMTX.yml:/opt/app/mediamtx.yml:ro
       - ./data/streams:/opt/app/streams
@@ -23,24 +62,40 @@ services:
       - ./data:/opt/app/data
       - ./data/certs:/opt/app/certs
     environment:
-      - PORT=3000                              # Flask web UI port
-      - MEDIAMTX_API_URL=http://localhost:8889  # MediaMTX API endpoint (internal)
-      - PYTHONUNBUFFERED=1                      # Ensures real-time log output in Docker
-      - STREAMS_DIR=/opt/app/streams            # Directory for recorded video files
-      - DATA_DIR=/opt/app/data                  # Directory for settings, API keys, state
-      - ACTIVE_CERTS_DIR=/opt/app/certs         # Directory for TLS certificates
+      - PORT=3000
+      - MEDIAMTX_API_URL=http://localhost:8889
+      - PYTHONUNBUFFERED=1
+      - STREAMS_DIR=/opt/app/streams
+      - DATA_DIR=/opt/app/data
+      - ACTIVE_CERTS_DIR=/opt/app/certs
       # Authentication — CHANGE THESE before deploying!
       - ADMIN_USERNAME=admin
-      - ADMIN_PASSWORD=changeme                 # ⚠️ Change this! Default triggers a warning banner
-      # Session key — set a fixed value so sessions survive container restarts
-      # Generate one with: python -c "import secrets; print(secrets.token_hex(32))"
-      - SECRET_KEY=change-me-to-a-random-secret-key
-      # Optional: auto-generate self-signed TLS certs on startup (default: false)
-      # Set to "true" only if you don't have your own certs (e.g. Let's Encrypt)
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-changeme}
+      - SECRET_KEY=${SECRET_KEY:-change-me-to-a-random-secret-key}
+      # --- mTLS identity from the nginx edge ---
+      - MTLS_ENABLED=${MTLS_ENABLED:-true}
+      - PROXY_SHARED_SECRET=${PROXY_SHARED_SECRET:-proxy-shared-change-me}
+      # CERT_DEFAULT_ROLE unset = fail-closed (unmapped cert gets no role).
+      # Map CN->role in ./data/cert_roles.json (git-ignored).
+      # - CERT_DEFAULT_ROLE=viewer
+      # --- HLS fail-closed + data-plane offload to nginx ---
+      - HLS_REQUIRE_AUTH=${HLS_REQUIRE_AUTH:-true}
+      - HLS_X_ACCEL=${HLS_X_ACCEL:-true}
+      # --- Observability ---
+      - LOG_JSON=${LOG_JSON:-true}
+      # - AUDIT_SYSLOG_HOST=siem.internal   # ship audit trail to your SIEM
+      # - AUDIT_SYSLOG_PORT=514
+      # --- App -> MediaMTX control API credentials (match the MTX_ override below) ---
+      - MEDIAMTX_API_USER=control
+      - MEDIAMTX_API_PASS=${MEDIAMTX_API_PASS:-mediamtx-change-me}
+      # --- MediaMTX self-config overrides (same container) ---
+      # Control-API password (authInternalUsers[0]) and remote-publish CIDR
+      # (authInternalUsers[2]) injected via MediaMTX's MTX_ env overrides.
+      - MTX_AUTHINTERNALUSERS_0_PASS=${MEDIAMTX_API_PASS:-mediamtx-change-me}
+      - MTX_AUTHINTERNALUSERS_2_IPS=${VPN_CIDR:-10.0.0.0/8}
+      # Optional: auto-generate self-signed RTSPS certs / HTTPS for the app itself
       # - AUTO_GENERATE_CERTS=true
-      # HTTPS for web UI (disabled by default)
-      # - HTTPS_ENABLED=true
-      # - ENABLE_GPU_ENCODING=1                 # Uncomment to enable NVIDIA GPU encoding (requires GPU support below)
+      # - ENABLE_GPU_ENCODING=1
     restart: unless-stopped
     deploy:
       resources:
@@ -50,13 +105,6 @@ services:
         reservations:
           cpus: '1.0'
           memory: 2G
-    # Uncomment for NVIDIA GPU support (requires nvidia-docker2 installed):
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: 1
-    #           capabilities: [gpu]
     logging:
       driver: json-file
       options:
@@ -68,3 +116,9 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
+    networks:
+      - edge
+
+networks:
+  edge:
+    driver: bridge

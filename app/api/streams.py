@@ -17,8 +17,9 @@ import os
 from pathlib import Path
 
 from app.config import (
-    MEDIAMTX_API_URL, DATA_DIR,
-    PULL_STREAM_BUFFER_SIZE, PULL_STREAM_MAX_DELAY
+    MEDIAMTX_API_URL, DATA_DIR, FFMPEG_LOG_DIR,
+    PULL_STREAM_BUFFER_SIZE, PULL_STREAM_MAX_DELAY,
+    MEDIAMTX_API_USER, MEDIAMTX_API_PASS, MEDIAMTX_API_TOKEN, MEDIAMTX_API_AUTH
 )
 from app.state import (
     active_recordings, active_pull_streams, pull_stream_configs,
@@ -26,8 +27,11 @@ from app.state import (
     recording_lock, pull_stream_lock, hidden_streams, hidden_streams_lock
 )
 from app.services.mediamtx import MediaMTXClient
+from app.services.process import ManagedProcess
 from app.utils.codec_detection import detect_stream_codec, analyze_recording
 from app.utils.thumbnail import generate_thumbnail
+from app.utils.atomic_json import write_json_atomic
+from app.utils.validation import is_valid_stream_name, validate_source_url
 from app.websocket.broadcast import broadcast
 import logging
 import json
@@ -36,7 +40,8 @@ import requests as http_requests
 logger = logging.getLogger(__name__)
 
 streams_bp = Blueprint('streams', __name__)
-mediamtx = MediaMTXClient(MEDIAMTX_API_URL)
+mediamtx = MediaMTXClient(MEDIAMTX_API_URL, user=MEDIAMTX_API_USER,
+                          password=MEDIAMTX_API_PASS, token=MEDIAMTX_API_TOKEN)
 
 # Track last time bytes were received per stream (for last_data_time)
 _stream_bytes_tracker: dict = {}  # {stream_name: {'bytes': int, 'last_change': float}}
@@ -83,11 +88,7 @@ def _save_pull_source(stream_name: str, source_url: str, username: str = '', pas
     """Persist a pull stream's config to disk (atomic write)."""
     _pull_sources[stream_name] = {'source_url': source_url, 'username': username, 'password': password}
     try:
-        os.makedirs(DATA_DIR, exist_ok=True)
-        tmp = _PULL_SOURCES_FILE + '.tmp'
-        with open(tmp, 'w') as f:
-            json.dump(_pull_sources, f, indent=2)
-        os.replace(tmp, _PULL_SOURCES_FILE)
+        write_json_atomic(_PULL_SOURCES_FILE, _pull_sources)
     except Exception as e:
         logger.warning(f"Could not save pull_sources.json: {e}")
 
@@ -97,10 +98,7 @@ def _remove_pull_source(stream_name: str):
     if stream_name in _pull_sources:
         del _pull_sources[stream_name]
         try:
-            tmp = _PULL_SOURCES_FILE + '.tmp'
-            with open(tmp, 'w') as f:
-                json.dump(_pull_sources, f, indent=2)
-            os.replace(tmp, _PULL_SOURCES_FILE)
+            write_json_atomic(_PULL_SOURCES_FILE, _pull_sources)
         except Exception as e:
             logger.warning(f"Could not update pull_sources.json: {e}")
 
@@ -125,11 +123,7 @@ def _load_blocked_ips():
 def _save_blocked_ips():
     """Persist IP blocklist to disk (atomic write)."""
     try:
-        os.makedirs(DATA_DIR, exist_ok=True)
-        tmp = _BLOCKED_IPS_FILE + '.tmp'
-        with open(tmp, 'w') as f:
-            json.dump(sorted(_blocked_ips), f, indent=2)
-        os.replace(tmp, _BLOCKED_IPS_FILE)
+        write_json_atomic(_BLOCKED_IPS_FILE, sorted(_blocked_ips))
     except Exception as e:
         logger.warning(f"Could not save blocked_ips.json: {e}")
 
@@ -153,20 +147,28 @@ def get_blocked_ips() -> set:
     return _blocked_ips
 
 
+def _spawn_pull_process(stream_name: str, source_url: str) -> ManagedProcess:
+    """Spawn the pull-relay FFmpeg under the process supervisor.
+
+    Uses ManagedProcess so stderr is captured to a log file (no PIPE buffer that
+    could deadlock a long-running relay) and the child runs in its own session
+    for a clean, bounded teardown. Raises RuntimeError if FFmpeg won't start.
+    """
+    ffmpeg_args = _build_pull_ffmpeg_args(source_url, stream_name)
+    proc = ManagedProcess(f'pull-{stream_name}', ffmpeg_args, FFMPEG_LOG_DIR,
+                          label=f'pull:{stream_name}')
+    if not proc.start():
+        raise RuntimeError(f'Failed to start pull FFmpeg for {stream_name}')
+    return proc
+
+
 def _start_pull_impl(stream_name: str, source_url: str, username: str = '', password: str = ''):
     """Core logic to launch a pull stream FFmpeg process and its monitor thread.
     Called both from the API endpoint and from the startup restore path.
     Raises on error.
     """
-    ffmpeg_args = _build_pull_ffmpeg_args(source_url, stream_name)
     logger.info(f"Starting pull stream: {stream_name} from {source_url}")
-
-    process = subprocess.Popen(
-        ffmpeg_args,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE
-    )
+    process = _spawn_pull_process(stream_name, source_url)
 
     with pull_stream_lock:
         active_pull_streams[stream_name] = process
@@ -257,7 +259,7 @@ def _fetch_connection_map() -> dict:
     result = {}
     for endpoint in _SOURCE_TYPE_ENDPOINTS.values():
         try:
-            resp = http_requests.get(f'{MEDIAMTX_API_URL}{endpoint}', timeout=3)
+            resp = http_requests.get(f'{MEDIAMTX_API_URL}{endpoint}', timeout=3, **MEDIAMTX_API_AUTH)
             if resp.status_code == 200:
                 for item in resp.json().get('items', []):
                     conn_id = item.get('id', '')
@@ -291,7 +293,7 @@ def _resolve_source_info(source: dict | None, conn_map: dict | None = None) -> d
         endpoint = _SOURCE_TYPE_ENDPOINTS.get(src_type)
         if endpoint and src_id:
             try:
-                resp = http_requests.get(f'{MEDIAMTX_API_URL}{endpoint}', timeout=3)
+                resp = http_requests.get(f'{MEDIAMTX_API_URL}{endpoint}', timeout=3, **MEDIAMTX_API_AUTH)
                 if resp.status_code == 200:
                     for item in resp.json().get('items', []):
                         if item.get('id') == src_id:
@@ -506,8 +508,10 @@ def _finalize_recording_for_reconnect(stream_name: str):
         recording_info = active_recordings[stream_name]
         recording_process = recording_info.get('process')
         if recording_process and recording_process.poll() is None:
-            recording_process.stdin.write(b'q')
-            recording_process.stdin.flush()
+            # recording_process is a ManagedProcess: ask FFmpeg to quit cleanly
+            # (writes the MOV moov atom) via its stdin 'q', falling back to SIGTERM.
+            if not recording_process.request_graceful_quit():
+                recording_process.terminate()
             try:
                 recording_process.wait(timeout=10)
             except subprocess.TimeoutExpired:
@@ -536,15 +540,16 @@ def _pull_stream_loop(stream_name: str):
         if not process:
             break
 
-        # Drain stderr and wait for exit
-        stderr_output = []
-        for line in process.stderr:
-            stderr_output.append(line.decode('utf-8', errors='ignore'))
+        # Wait for exit; stderr is captured to a log file by ManagedProcess
+        # (no PIPE to drain), so there is no deadlock risk on long relays.
         return_code = process.wait()
+        stderr_tail = process.tail_stderr(20)
+        process.close()
 
         if return_code != 0:
             logger.error(f"Pull stream FFmpeg exited with code {return_code} for {stream_name}")
-            logger.error(f"FFmpeg stderr: {''.join(stderr_output[-20:])}")
+            if stderr_tail:
+                logger.error(f"FFmpeg stderr: {' / '.join(stderr_tail)}")
 
         # Clean up process reference
         with pull_stream_lock:
@@ -614,13 +619,7 @@ def _pull_stream_loop(stream_name: str):
         # Start a new FFmpeg process
         try:
             source_url = config['source_url']
-            ffmpeg_args = _build_pull_ffmpeg_args(source_url, stream_name)
-            new_process = subprocess.Popen(
-                ffmpeg_args,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-            )
+            new_process = _spawn_pull_process(stream_name, source_url)
             with pull_stream_lock:
                 active_pull_streams[stream_name] = new_process
             broadcast('pull_stream_reconnected', {
@@ -946,6 +945,9 @@ def start_pull_stream(stream_name):
         }
     """
     try:
+        if not is_valid_stream_name(stream_name):
+            return jsonify({'error': 'Invalid stream name'}), 400
+
         data = request.get_json()
         if not data:
             return jsonify({'error': 'Request body required'}), 400
@@ -954,16 +956,10 @@ def start_pull_stream(stream_name):
         if not source_url:
             return jsonify({'error': 'URL required in request body (url or sourceUrl)'}), 400
 
-        # Validate source URL protocol
-        import urllib.parse
-        try:
-            parsed = urllib.parse.urlparse(source_url)
-        except Exception:
-            return jsonify({'error': 'Malformed URL'}), 400
-        if parsed.scheme not in ('rtsp', 'rtsps', 'srt', 'http', 'https'):
-            return jsonify({'error': f'Unsupported protocol: {parsed.scheme}. Allowed: rtsp, rtsps, srt, http, https'}), 400
-        if not parsed.netloc:
-            return jsonify({'error': 'URL must include a host'}), 400
+        # Validate source URL: scheme allow-list + anti-SSRF host checks
+        ok, err = validate_source_url(source_url)
+        if not ok:
+            return jsonify({'error': err}), 400
 
         username = data.get('username', '')
         password = data.get('password', '')
@@ -1111,6 +1107,81 @@ def get_recording_status():
             'codec': recording.get('codec', 'unknown')
         }
     return jsonify(status)
+
+
+def _proc_health(proc):
+    """Summarise a ManagedProcess for health reporting (None-safe)."""
+    if proc is None:
+        return {'active': False}
+    try:
+        alive = proc.is_alive()
+        return {
+            'active': alive,
+            'pid': proc.pid,
+            'uptime_seconds': round(proc.uptime(), 1),
+            'returncode': proc.returncode,
+            'recent_stderr': proc.tail_stderr(5) if not alive else [],
+        }
+    except Exception as e:
+        return {'active': False, 'error': str(e)}
+
+
+def _collect_stream_health(stream_name):
+    """Aggregate per-stream health across recording, pull and ABR processes.
+
+    Reuses ManagedProcess (is_alive/pid/uptime/returncode/tail_stderr) and
+    abr_manager.status(). Overall status: down if an expected process died with a
+    non-zero exit; degraded if it restarted/retried; healthy if running; inactive
+    if nothing is running for this stream."""
+    from app.services.abr import abr_manager  # lazy: avoid import-order coupling
+
+    with recording_lock:
+        rec_entry = active_recordings.get(stream_name)
+        recording = _proc_health(rec_entry.get('process') if rec_entry else None)
+    with pull_stream_lock:
+        pull_proc = active_pull_streams.get(stream_name)
+        pull_cfg = pull_stream_configs.get(stream_name) or {}
+        pull = _proc_health(pull_proc)
+        pull['retry_count'] = pull_cfg.get('retry_count', 0)
+    abr = abr_manager.status(stream_name)
+
+    # Derive an overall status.
+    components = [recording, pull]
+    any_active = any(c.get('active') for c in components) or abr.get('running')
+    died = any(c.get('returncode') not in (None, 0) for c in components)
+    degraded = (pull.get('retry_count', 0) > 0) or (abr.get('restart_count', 0) > 0)
+    if died:
+        status = 'down'
+    elif any_active:
+        status = 'degraded' if degraded else 'healthy'
+    else:
+        status = 'inactive'
+
+    return {
+        'stream': stream_name,
+        'status': status,
+        'recording': recording,
+        'pull': pull,
+        'abr': {
+            'active': bool(abr.get('running')),
+            'pid': abr.get('pid'),
+            'uptime_seconds': abr.get('uptime_seconds', 0),
+            'restart_count': abr.get('restart_count', 0),
+        },
+        'timestamp': datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@streams_bp.route('/api/streams/<path:stream_name>/health', methods=['GET'])
+def get_stream_health(stream_name):
+    """Per-stream health derived from the supervised FFmpeg processes (viewer+)."""
+    if not is_valid_stream_name(stream_name):
+        return jsonify({'error': 'Invalid stream name'}), 400
+    try:
+        return jsonify(_collect_stream_health(stream_name)), 200
+    except Exception as e:
+        logger.error(f"Error collecting health for {stream_name}: {e}")
+        return jsonify({'error': str(e)}), 500
 
 
 @streams_bp.route('/api/post-processing/status', methods=['GET'])

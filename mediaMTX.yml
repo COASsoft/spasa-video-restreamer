@@ -13,23 +13,41 @@ writeQueueSize: 512
 udpMaxPayloadSize: 1452
 
 ###############################################
-# Global settings -> Authentication
-# Allow any user to publish or read without credentials.
-# This is needed for SRT streams from ATAK/drones that don't send credentials.
+# Global settings -> Authentication (Phase 1 infra "B" — fail-closed lockdown)
+#
+# Trust model for the VPN-only, single-node deployment:
+#   [0] control  — control API / metrics / pprof, CREDENTIALED, loopback-only.
+#                  The Flask app authenticates as this user (MEDIAMTX_API_USER/PASS).
+#   [1] local    — publish/read/playback for the IN-CONTAINER app + ffmpeg + ABR,
+#                  credential-less but loopback-only (they connect via 127.0.0.1).
+#                  This also keeps the app's HLS proxy fetch working without creds.
+#   [2] ingest   — REMOTE publish for drones/ATAK that cannot send credentials,
+#                  restricted to the VPN/internal CIDR. No remote read/playback/api,
+#                  so HLS/RTSP cannot be pulled anonymously from off-box.
+#
+# Secrets/CIDR are injected via env (NOT hardcoded) using MediaMTX's MTX_ override:
+#   MTX_AUTHINTERNALUSERS_0_PASS  == MEDIAMTX_API_PASS   (control API password)
+#   MTX_AUTHINTERNALUSERS_2_IPS   == VPN_CIDR            (e.g. 10.0.0.0/8)
+# The placeholder password below is an obvious "change me" default; override it.
 authMethod: internal
 authInternalUsers:
-  - user: any
-    ips: []
-    permissions:
-      - action: publish
-      - action: read
-      - action: playback
-  - user: any
+  - user: control
+    pass: mediamtx-change-me
     ips: ['127.0.0.1', '::1']
     permissions:
       - action: api
       - action: metrics
       - action: pprof
+  - user: any
+    ips: ['127.0.0.1', '::1']
+    permissions:
+      - action: publish
+      - action: read
+      - action: playback
+  - user: any
+    ips: ['127.0.0.1/32']
+    permissions:
+      - action: publish
 
 ###############################################
 # Global settings -> Control API

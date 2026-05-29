@@ -13,9 +13,9 @@ from flask import Blueprint, request, jsonify
 from flask_login import login_user, logout_user, current_user
 
 from app.auth import (
-    _check_credentials, auth_required, audit_log, read_audit_log,
+    _check_credentials, auth_required, audit_log, read_audit_log, verify_audit_chain,
     generate_api_key, revoke_api_key, list_api_keys,
-    _DEFAULT_CREDS,
+    _DEFAULT_CREDS, _ROLE_RANK, ROLE_VIEWER,
 )
 
 logger = logging.getLogger(__name__)
@@ -97,13 +97,17 @@ def create_api_key():
     name = data.get('name', 'unnamed')
     if not name or len(name) > 64:
         return jsonify({'error': 'Key name required (max 64 chars)'}), 400
+    role = data.get('role', ROLE_VIEWER)
+    if role not in _ROLE_RANK:
+        return jsonify({'error': f'Invalid role: {role!r} (expected viewer/operator/admin)'}), 400
 
-    raw_key = generate_api_key(name)
-    audit_log('api_key_created', f'Key created: {name}')
+    raw_key = generate_api_key(name, role=role)
+    audit_log('api_key_created', f'Key created: {name} (role={role})')
     return jsonify({
         'success': True,
         'key': raw_key,
         'name': name,
+        'role': role,
         'note': 'Save this key — it cannot be retrieved again.',
     })
 
@@ -125,6 +129,14 @@ def delete_api_key(key_hash):
 @auth_bp.route('/api/audit', methods=['GET'])
 @auth_required
 def get_audit_log():
-    """Return recent audit log entries."""
+    """Return recent audit log entries (JSON-lines records)."""
     lines = int(request.args.get('lines', 200))
     return jsonify({'entries': read_audit_log(lines)})
+
+
+@auth_bp.route('/api/audit/verify', methods=['GET'])
+@auth_required
+def verify_audit():
+    """Verify the audit hash-chain (admin). Reports the first broken line, if any."""
+    result = verify_audit_chain()
+    return jsonify(result), (200 if result.get('ok') else 409)

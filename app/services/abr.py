@@ -26,15 +26,13 @@ import time
 from typing import Dict, Optional
 import requests
 
-from app.config import MEDIAMTX_API_URL, DATA_DIR
+from app.config import MEDIAMTX_API_URL, DATA_DIR, FFMPEG_LOG_DIR
+from app.utils.atomic_json import write_json_atomic, read_json
 
 logger = logging.getLogger(__name__)
 
 # Directory where HLS segments and playlists are written
 HLS_OUTPUT_DIR = os.environ.get('HLS_OUTPUT_DIR', '/opt/app/hls')
-
-# Directory for FFmpeg stderr logs
-FFMPEG_LOG_DIR = os.environ.get('FFMPEG_LOG_DIR', os.path.join(os.environ.get('LOGS_DIR', '/opt/app/logs'), 'ffmpeg'))
 
 # MediaMTX RTSP endpoint for FFmpeg to read from.
 # Use 127.0.0.1 (not 'localhost') to avoid IPv6 resolution issues on Windows
@@ -162,19 +160,16 @@ class ABRManager:
         try:
             with self._lock:
                 active = list(self._streams.keys())
-            os.makedirs(os.path.dirname(ABR_STATE_FILE), exist_ok=True)
-            with open(ABR_STATE_FILE, 'w') as f:
-                json.dump({'streams': active}, f)
+            write_json_atomic(ABR_STATE_FILE, {'streams': active})
         except Exception as e:
             logger.warning(f"Could not save ABR state: {e}")
 
     def restore_state(self):
         """Restore ABR processes from saved state (called at startup)."""
-        if not os.path.exists(ABR_STATE_FILE):
+        state = read_json(ABR_STATE_FILE, default=None)
+        if not state:
             return
         try:
-            with open(ABR_STATE_FILE, 'r') as f:
-                state = json.load(f)
             streams = state.get('streams', [])
             if not streams:
                 return

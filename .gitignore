@@ -62,6 +62,19 @@ data/hls/
 #TLS certificates
 data/certs/
 
+#PKI material for the nginx mTLS proxy (dev-generated or real SPASA PKI) — never commit
+nginx/pki/*.crt
+nginx/pki/*.key
+nginx/pki/*.pem
+nginx/pki/*.srl
+nginx/pki/index.txt*
+nginx/pki/crlnumber*
+nginx/pki/*.cnf
+
+#cert -> role map (may carry operational identities)
+cert_roles.json
+data/cert_roles.json
+
 #misc data artifacts
 data/*.json
 recent_logs*.txt

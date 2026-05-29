@@ -14,11 +14,11 @@ import time
 import logging
 import requests
 from datetime import datetime, timezone
-import subprocess
 import os
 
 from app import create_app
-from app.config import PORT, MEDIAMTX_API_URL, MEDIAMTX_RTSP_URL, STREAMS_DIR, SRT_BUFFER_AVAILABLE
+from app.config import (PORT, MEDIAMTX_API_URL, MEDIAMTX_RTSP_URL, STREAMS_DIR, SRT_BUFFER_AVAILABLE,
+                        MEDIAMTX_API_USER, MEDIAMTX_API_PASS, MEDIAMTX_API_TOKEN, MEDIAMTX_API_AUTH)
 from app.state import (
     active_recordings, active_pull_streams, thumbnail_executor, post_process_executor,
     known_streams, get_srt_buffer_manager, recording_lock
@@ -28,6 +28,7 @@ from app.websocket.broadcast import broadcast
 from app.services.standby import standby_manager
 from app.services.cleanup import start_cleanup_service
 from app.services.mediamtx import MediaMTXClient
+from app.api.recordings import begin_recording
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +86,13 @@ def monitor_streams_for_auto_record():
 
     logger.info("Stream monitor thread started")
 
-    _blocklist_mtx = MediaMTXClient(MEDIAMTX_API_URL)
+    _blocklist_mtx = MediaMTXClient(MEDIAMTX_API_URL, user=MEDIAMTX_API_USER,
+                                    password=MEDIAMTX_API_PASS, token=MEDIAMTX_API_TOKEN)
+
+    from app.websocket.broadcast import broadcast
+    from app.api.streams import _collect_stream_health
+    _last_health_bcast = 0.0
+    _HEALTH_BCAST_INTERVAL = 10.0  # seconds
 
     while True:
         try:
@@ -96,7 +103,7 @@ def monitor_streams_for_auto_record():
 
             if app_state.auto_record_enabled:
                 # Get current streams from MediaMTX
-                response = requests.get(f'{MEDIAMTX_API_URL}/v3/paths/list', timeout=5)
+                response = requests.get(f'{MEDIAMTX_API_URL}/v3/paths/list', timeout=5, **MEDIAMTX_API_AUTH)
                 if response.status_code == 200:
                     paths_data = response.json()
                     items = paths_data if isinstance(paths_data, list) else paths_data.get('items', {})
@@ -137,9 +144,18 @@ def monitor_streams_for_auto_record():
                                     stream_info = detect_stream_codec(rtsp_url)
                                     if stream_info:
                                         now = datetime.now(timezone.utc)
-                                        timestamp = now.strftime('%Y%m%d_%H%M%S')
-                                        filename = f"{stream_name}_{timestamp}.mov"
-                                        output_path = os.path.join(STREAMS_DIR, filename)
+                                        # Write into the per-stream subdir using the
+                                        # SAME naming as manual recordings so that
+                                        # list_recordings (which only scans subdirs),
+                                        # the segmented glob (recording-*.mov) and
+                                        # thumbnails all treat auto-records identically.
+                                        # Previously this wrote to the STREAMS_DIR root,
+                                        # so auto-records were never listed.
+                                        stream_dir = os.path.join(STREAMS_DIR, stream_name)
+                                        os.makedirs(stream_dir, exist_ok=True)
+                                        timestamp = now.strftime('%Y-%m-%dT%H-%M-%S-%f')[:-3] + 'Z'
+                                        filename = f"recording-{timestamp}.mov"
+                                        output_path = os.path.join(stream_dir, filename)
 
                                         has_audio = stream_info.get('has_audio', False)
                                         has_data = stream_info.get('has_data', False)
@@ -169,32 +185,22 @@ def monitor_streams_for_auto_record():
                                             output_path
                                         ])
 
-                                        # Start FFmpeg process
-                                        # stderr→DEVNULL: PIPE causes deadlock after ~200s
-                                        # (64KB OS buffer fills with progress lines, FFmpeg blocks)
-                                        process = subprocess.Popen(
-                                            ffmpeg_args,
-                                            stdout=subprocess.DEVNULL,
-                                            stderr=subprocess.DEVNULL,
+                                        # Spawn + track via the unified supervisor:
+                                        # same active_recordings schema as manual
+                                        # recordings (fixes the old divergence that
+                                        # left auto-records unstoppable), captured
+                                        # stderr, and graceful 'q' quit on stop.
+                                        proc = begin_recording(
+                                            stream_name, ffmpeg_args, output_path,
+                                            codec=stream_info.get('codec', 'h264'),
+                                            has_data=has_data,
+                                            auto_started=True,
+                                            start_dt=now,
                                         )
-
-                                        # Store recording info
-                                        with recording_lock:
-                                            active_recordings[stream_name] = {
-                                                'process': process,
-                                                'filename': filename,
-                                                'output_path': output_path,
-                                                'start_time': now.isoformat(),
-                                                'auto_started': True
-                                            }
-
-                                        logger.info(f"Auto-record started for {stream_name}: {filename}")
-                                        broadcast('recording_started', {
-                                            'stream': stream_name,
-                                            'filename': filename,
-                                            'hasKlv': has_data,
-                                            'auto_started': True
-                                        })
+                                        if proc:
+                                            logger.info(f"Auto-record started for {stream_name}: {filename}")
+                                        else:
+                                            logger.error(f"Auto-record: FFmpeg failed to start for {stream_name}")
 
                                 except Exception as e:
                                     logger.error(f"Error auto-starting recording for {stream_name}: {e}")
@@ -228,9 +234,30 @@ def monitor_streams_for_auto_record():
         except Exception as e:
             logger.debug(f"Blocklist enforcement error: {e}")
 
+        # Periodically broadcast per-stream health (throttled, independent of
+        # auto-record) so UIs get live process health without polling.
+        try:
+            now = time.monotonic()
+            if now - _last_health_bcast >= _HEALTH_BCAST_INTERVAL:
+                _last_health_bcast = now
+                active = set(app_state.active_recordings) | set(app_state.active_pull_streams)
+                for stream_name in active:
+                    broadcast('stream_health', _collect_stream_health(stream_name))
+        except Exception as e:
+            logger.debug(f"stream_health broadcast error: {e}")
+
         # Check every 2 seconds
         time.sleep(2)
 
+
+# Wire process registration and reap any FFmpeg orphaned by a previously crashed
+# instance BEFORE create_app() (whose ABR restore may itself spawn processes).
+from app.services.reconcile import install_hooks as _install_proc_hooks, reconcile_orphans as _reconcile_orphans
+_install_proc_hooks()
+try:
+    _reconcile_orphans()
+except Exception as e:
+    logger.error(f"Startup reconciliation failed: {e}")
 
 # Create Flask app at module level for Gunicorn
 app = create_app()
