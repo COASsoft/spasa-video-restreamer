@@ -10,23 +10,27 @@ Test Pattern API endpoints
 import logging
 import os
 import re
-import subprocess
 import time
 import uuid
 from flask import Blueprint, request, jsonify
+
+from app.utils.validation import is_valid_stream_name
+from app.services.process import ManagedProcess
 
 logger = logging.getLogger(__name__)
 
 test_bp = Blueprint('test', __name__, url_prefix='/api/test')
 
+# Where FFmpeg stderr for test patterns is captured (shared with other services).
+_FFMPEG_LOG_DIR = os.environ.get(
+    'FFMPEG_LOG_DIR', os.path.join(os.environ.get('LOGS_DIR', '/opt/app/logs'), 'ffmpeg'))
+
 # Store active test processes
 active_tests = {}
 
-# Stream name validation — only safe characters
-_STREAM_NAME_RE = re.compile(r'^[a-zA-Z0-9_-]+$')
 
 def _validate_stream_name(name: str) -> bool:
-    return bool(name) and len(name) <= 64 and bool(_STREAM_NAME_RE.match(name))
+    return is_valid_stream_name(name)
 
 _RESOLUTION_RE = re.compile(r'^\d{1,5}x\d{1,5}$')
 
@@ -124,7 +128,10 @@ def _start_test(protocol: str):
     logger.info(f"Starting {label} test pattern: {stream_name} ({resolution} {framerate}fps {pattern}) "
                 f"{'continuous' if duration == 0 else f'{duration}s'}")
 
-    process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    process = ManagedProcess(f'test-{stream_name}', cmd, _FFMPEG_LOG_DIR,
+                             label=f'test:{protocol}:{stream_name}')
+    if not process.start():
+        return jsonify({'success': False, 'error': 'Failed to start FFmpeg'}), 500
     active_tests[test_id] = {
         'process': process,
         'protocol': protocol,
@@ -221,14 +228,10 @@ def stop_test(test_id):
         
         test_info = active_tests[test_id]
         process = test_info['process']
-        
-        if process.poll() is None:  # Process still running
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-        
+
+        # Bounded graceful stop (SIGTERM -> wait -> SIGKILL), never blocks long.
+        process.stop(term_timeout=5)
+
         del active_tests[test_id]
         
         return jsonify({

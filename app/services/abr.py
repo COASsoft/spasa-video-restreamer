@@ -27,6 +27,7 @@ from typing import Dict, Optional
 import requests
 
 from app.config import MEDIAMTX_API_URL, DATA_DIR
+from app.utils.atomic_json import write_json_atomic, read_json
 
 logger = logging.getLogger(__name__)
 
@@ -162,19 +163,16 @@ class ABRManager:
         try:
             with self._lock:
                 active = list(self._streams.keys())
-            os.makedirs(os.path.dirname(ABR_STATE_FILE), exist_ok=True)
-            with open(ABR_STATE_FILE, 'w') as f:
-                json.dump({'streams': active}, f)
+            write_json_atomic(ABR_STATE_FILE, {'streams': active})
         except Exception as e:
             logger.warning(f"Could not save ABR state: {e}")
 
     def restore_state(self):
         """Restore ABR processes from saved state (called at startup)."""
-        if not os.path.exists(ABR_STATE_FILE):
+        state = read_json(ABR_STATE_FILE, default=None)
+        if not state:
             return
         try:
-            with open(ABR_STATE_FILE, 'r') as f:
-                state = json.load(f)
             streams = state.get('streams', [])
             if not streams:
                 return

@@ -28,6 +28,8 @@ from app.state import (
 from app.services.mediamtx import MediaMTXClient
 from app.utils.codec_detection import detect_stream_codec, analyze_recording
 from app.utils.thumbnail import generate_thumbnail
+from app.utils.atomic_json import write_json_atomic
+from app.utils.validation import is_valid_stream_name, validate_source_url
 from app.websocket.broadcast import broadcast
 import logging
 import json
@@ -83,11 +85,7 @@ def _save_pull_source(stream_name: str, source_url: str, username: str = '', pas
     """Persist a pull stream's config to disk (atomic write)."""
     _pull_sources[stream_name] = {'source_url': source_url, 'username': username, 'password': password}
     try:
-        os.makedirs(DATA_DIR, exist_ok=True)
-        tmp = _PULL_SOURCES_FILE + '.tmp'
-        with open(tmp, 'w') as f:
-            json.dump(_pull_sources, f, indent=2)
-        os.replace(tmp, _PULL_SOURCES_FILE)
+        write_json_atomic(_PULL_SOURCES_FILE, _pull_sources)
     except Exception as e:
         logger.warning(f"Could not save pull_sources.json: {e}")
 
@@ -97,10 +95,7 @@ def _remove_pull_source(stream_name: str):
     if stream_name in _pull_sources:
         del _pull_sources[stream_name]
         try:
-            tmp = _PULL_SOURCES_FILE + '.tmp'
-            with open(tmp, 'w') as f:
-                json.dump(_pull_sources, f, indent=2)
-            os.replace(tmp, _PULL_SOURCES_FILE)
+            write_json_atomic(_PULL_SOURCES_FILE, _pull_sources)
         except Exception as e:
             logger.warning(f"Could not update pull_sources.json: {e}")
 
@@ -125,11 +120,7 @@ def _load_blocked_ips():
 def _save_blocked_ips():
     """Persist IP blocklist to disk (atomic write)."""
     try:
-        os.makedirs(DATA_DIR, exist_ok=True)
-        tmp = _BLOCKED_IPS_FILE + '.tmp'
-        with open(tmp, 'w') as f:
-            json.dump(sorted(_blocked_ips), f, indent=2)
-        os.replace(tmp, _BLOCKED_IPS_FILE)
+        write_json_atomic(_BLOCKED_IPS_FILE, sorted(_blocked_ips))
     except Exception as e:
         logger.warning(f"Could not save blocked_ips.json: {e}")
 
@@ -946,6 +937,9 @@ def start_pull_stream(stream_name):
         }
     """
     try:
+        if not is_valid_stream_name(stream_name):
+            return jsonify({'error': 'Invalid stream name'}), 400
+
         data = request.get_json()
         if not data:
             return jsonify({'error': 'Request body required'}), 400
@@ -954,16 +948,10 @@ def start_pull_stream(stream_name):
         if not source_url:
             return jsonify({'error': 'URL required in request body (url or sourceUrl)'}), 400
 
-        # Validate source URL protocol
-        import urllib.parse
-        try:
-            parsed = urllib.parse.urlparse(source_url)
-        except Exception:
-            return jsonify({'error': 'Malformed URL'}), 400
-        if parsed.scheme not in ('rtsp', 'rtsps', 'srt', 'http', 'https'):
-            return jsonify({'error': f'Unsupported protocol: {parsed.scheme}. Allowed: rtsp, rtsps, srt, http, https'}), 400
-        if not parsed.netloc:
-            return jsonify({'error': 'URL must include a host'}), 400
+        # Validate source URL: scheme allow-list + anti-SSRF host checks
+        ok, err = validate_source_url(source_url)
+        if not ok:
+            return jsonify({'error': err}), 400
 
         username = data.get('username', '')
         password = data.get('password', '')

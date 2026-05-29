@@ -21,6 +21,8 @@ import requests as http_requests
 from flask import Blueprint, jsonify, request, send_from_directory, abort, Response
 
 from app.services.abr import abr_manager, HLS_OUTPUT_DIR
+from app.utils.validation import is_valid_stream_name
+from app.config import CORS_ORIGINS
 
 logger = logging.getLogger(__name__)
 
@@ -28,10 +30,23 @@ hls_bp = Blueprint('hls', __name__)
 
 MEDIAMTX_HLS_URL = os.environ.get('MEDIAMTX_HLS_URL', 'http://127.0.0.1:8888')
 
+# Pre-computed CORS allow-list. None means "unrestricted" (CORS_ORIGINS='*'):
+# HLS media carries no credentials, so a literal '*' is safe — unlike blindly
+# reflecting the request Origin, which effectively allow-lists every site.
+_CORS_ALLOWLIST = None if CORS_ORIGINS.strip() == '*' else {
+    o.strip() for o in CORS_ORIGINS.split(',') if o.strip()
+}
+
 
 def _cors(response):
-    """Add CORS headers so external sites can embed our HLS streams."""
-    response.headers['Access-Control-Allow-Origin'] = request.headers.get('Origin', '*')
+    """Add CORS headers so allow-listed sites can embed our HLS streams."""
+    origin = request.headers.get('Origin')
+    if _CORS_ALLOWLIST is None:
+        response.headers['Access-Control-Allow-Origin'] = '*'
+    elif origin and origin in _CORS_ALLOWLIST:
+        response.headers['Access-Control-Allow-Origin'] = origin
+        response.headers['Vary'] = 'Origin'
+    # else: no Access-Control-Allow-Origin → browser blocks the cross-origin read
     response.headers['Access-Control-Allow-Methods'] = 'GET, HEAD, OPTIONS'
     response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Range, X-API-Key'
     response.headers['Access-Control-Expose-Headers'] = 'Content-Length, Content-Range'
@@ -88,7 +103,9 @@ def _playlist_response(filepath, check_abr_stream=None):
 
 
 def _valid_stream(name):
-    return bool(name) and re.match(r'^[a-zA-Z0-9_.-]+$', name) and len(name) <= 128
+    # Strict, centralized validation: rejects '..', leading/trailing separators
+    # and path separators (defence-in-depth for the <path:> route converter).
+    return is_valid_stream_name(name)
 
 
 # ------------------------------------------------------------------

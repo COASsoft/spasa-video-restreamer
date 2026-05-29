@@ -38,7 +38,25 @@ from app import create_app
 
 @pytest.fixture
 def client():
-    """Create test client"""
+    """Create an authenticated test client.
+
+    The app protects all /api/* and page routes via a before_request hook.
+    We authenticate with a freshly minted API key (decoupled from the admin
+    password) set as a default header on every request, so endpoint behaviour
+    — not the auth gate — is what gets exercised.
+    """
+    app = create_app()
+    app.config['TESTING'] = True
+    from app import auth
+    raw_key = auth.generate_api_key('pytest')
+    with app.test_client() as client:
+        client.environ_base['HTTP_X_API_KEY'] = raw_key
+        yield client
+
+
+@pytest.fixture
+def anon_client():
+    """Create an UNauthenticated test client for auth-enforcement tests."""
     app = create_app()
     app.config['TESTING'] = True
     with app.test_client() as client:
@@ -75,7 +93,9 @@ class TestHealthEndpoint:
         response = client.get('/health')
         data = json.loads(response.data)
         assert 'status' in data
-        assert data['status'] == 'healthy'
+        # 'healthy' when MediaMTX is reachable, 'degraded' when it is not
+        # (the process itself is alive either way — liveness vs readiness).
+        assert data['status'] in ('healthy', 'degraded')
     
     def test_health_endpoint_has_timestamp(self, client):
         """Test that health response includes timestamp"""
@@ -83,6 +103,16 @@ class TestHealthEndpoint:
         data = json.loads(response.data)
         assert 'timestamp' in data
         assert isinstance(data['timestamp'], str)
+
+    def test_ready_endpoint_shape(self, client):
+        """Readiness probe: 200 or 503 with the expected fields."""
+        response = client.get('/ready')
+        # 503 in tests because MediaMTX isn't running; 200 if it happens to be.
+        assert response.status_code in (200, 503)
+        data = json.loads(response.data)
+        for key in ('ready', 'mediamtx', 'dataDirWritable', 'streamsDirWritable'):
+            assert key in data
+        assert isinstance(data['ready'], bool)
     
     def test_health_endpoint_has_active_recordings(self, client):
         """Test that health response includes active recordings count"""
@@ -156,43 +186,46 @@ class TestStreamsEndpoint:
         assert len(data) > 0
     
     def test_create_pull_stream_endpoint_exists(self, client):
-        """Test that creating pull stream endpoint exists"""
-        response = client.post('/api/streams/pull',
-                              json={'streamName': 'test', 'sourceUrl': 'rtsp://example.com/stream'},
-                              content_type='application/json')
+        """Pull stream start: POST /api/streams/<name>/pull with a source URL."""
+        with patch('app.api.streams._start_pull_impl') as mock_pull, \
+             patch('app.api.streams.broadcast'):
+            response = client.post('/api/streams/test/pull',
+                                   json={'sourceUrl': 'rtsp://example.com/stream'},
+                                   content_type='application/json')
         assert response.status_code == 200
-    
+        mock_pull.assert_called_once()
+
     def test_create_pull_stream_with_full_data(self, client):
-        """Test creating pull stream with complete data"""
-        response = client.post('/api/streams/pull',
-                              json={
-                                  'streamName': 'test-stream',
-                                  'sourceUrl': 'rtsp://example.com/test'
-                              },
-                              content_type='application/json')
+        """Pull stream start accepts url + credentials and returns a JSON object."""
+        with patch('app.api.streams._start_pull_impl'), \
+             patch('app.api.streams.broadcast'):
+            response = client.post('/api/streams/test-stream/pull',
+                                   json={'url': 'rtsp://example.com/test',
+                                         'username': 'u', 'password': 'p'},
+                                   content_type='application/json')
         assert response.status_code == 200
         data = json.loads(response.data)
         assert isinstance(data, dict)
-    
-    def test_create_pull_stream_requires_data(self, client):
-        """Test that creating pull stream endpoint exists"""
-        response = client.post('/api/streams/pull')
-        # Endpoint exists and returns 200 even without data
-        assert response.status_code == 200
-    
-    def test_create_pull_stream_requires_stream_name(self, client):
-        """Test that creating pull stream accepts source URL"""
-        response = client.post('/api/streams/pull',
-                             json={'sourceUrl': 'rtsp://example.com/stream'},
-                             content_type='application/json')
-        assert response.status_code == 200
-    
+        assert data.get('success') is True
+
+    def test_create_pull_stream_requires_body(self, client):
+        """Pull stream start with an empty body returns 400."""
+        response = client.post('/api/streams/test/pull',
+                               json={}, content_type='application/json')
+        assert response.status_code == 400
+
     def test_create_pull_stream_requires_source_url(self, client):
-        """Test that creating pull stream accepts stream name"""
-        response = client.post('/api/streams/pull',
-                             json={'streamName': 'test'},
-                             content_type='application/json')
-        assert response.status_code == 200
+        """Pull stream start without a source URL returns 400."""
+        response = client.post('/api/streams/test/pull',
+                               json={'username': 'u'}, content_type='application/json')
+        assert response.status_code == 400
+
+    def test_create_pull_stream_rejects_unsupported_protocol(self, client):
+        """Pull stream start rejects non-allowed URL schemes (anti-SSRF)."""
+        response = client.post('/api/streams/test/pull',
+                               json={'sourceUrl': 'file:///etc/passwd'},
+                               content_type='application/json')
+        assert response.status_code == 400
     
     def test_delete_pull_stream_endpoint_exists(self, client):
         """Test that delete pull stream endpoint exists"""
@@ -206,25 +239,22 @@ class TestStreamsEndpoint:
         assert response.status_code in [200, 404]
     
     def test_pull_stream_workflow(self, client):
-        """Test complete pull stream workflow: create and delete"""
+        """Pull stream workflow: start (mocked), list, then stop-pull."""
         stream_name = 'workflow-test'
-        
-        # Create pull stream
-        create_response = client.post('/api/streams/pull',
-                                     json={
-                                         'streamName': stream_name,
-                                         'sourceUrl': 'rtsp://example.com/test'
-                                     },
-                                     content_type='application/json')
+
+        with patch('app.api.streams._start_pull_impl'), \
+             patch('app.api.streams.broadcast'):
+            create_response = client.post(f'/api/streams/{stream_name}/pull',
+                                          json={'sourceUrl': 'rtsp://example.com/test'},
+                                          content_type='application/json')
         assert create_response.status_code == 200
-        
-        # Verify it appears in streams list (optional, may not be immediate)
+
         list_response = client.get('/api/streams')
         assert list_response.status_code == 200
-        
-        # Delete pull stream
-        delete_response = client.delete(f'/api/streams/pull/{stream_name}')
-        assert delete_response.status_code in [200, 204, 404]
+
+        # Stop pull (real route: POST /api/streams/<name>/stop-pull)
+        stop_response = client.post(f'/api/streams/{stream_name}/stop-pull')
+        assert stop_response.status_code in [200, 404]
 
 
 # =============================================================================
@@ -454,12 +484,12 @@ class TestPatternGenerator:
             if 'testId' in data:
                 test_id = data['testId']
                 
-                # Check status
-                status_response = client.get(f'/api/test/{test_id}')
+                # Check status (real route: GET /api/test/<id>/status)
+                status_response = client.get(f'/api/test/{test_id}/status')
                 assert status_response.status_code == 200
-                
-                # Stop test
-                stop_response = client.delete(f'/api/test/{test_id}')
+
+                # Stop test (real route: POST /api/test/<id>/stop)
+                stop_response = client.post(f'/api/test/{test_id}/stop')
                 assert stop_response.status_code in [200, 204]
     
     def test_test_pattern_requires_stream_name(self, client):
@@ -469,6 +499,64 @@ class TestPatternGenerator:
                               content_type='application/json')
         # May accept empty or return error
         assert response.status_code in [200, 201, 400]
+
+
+# =============================================================================
+# HLS Access Validation Tests
+# =============================================================================
+
+class TestHlsAccessValidation:
+    """Stream-name validation on the public HLS routes (defence-in-depth)."""
+
+    def test_hls_rejects_traversal_name(self, client):
+        # '..' in the stream name must be rejected before any path join.
+        response = client.get('/hls/a..b/master.m3u8')
+        assert response.status_code == 400
+
+    def test_hls_valid_name_passes_validation(self, client):
+        # A valid name passes validation; the file simply doesn't exist (404),
+        # which proves the 400 above came from validation, not a missing file.
+        response = client.get('/hls/valid-stream/master.m3u8')
+        assert response.status_code == 404
+
+    def test_hls_proxy_cors_preflight(self, client):
+        # OPTIONS preflight on the (public) HLS proxy returns CORS headers.
+        # With no allow-list configured (CORS_ORIGINS='*'), origin is '*'.
+        response = client.options('/api/hls/proxy/teststream/index.m3u8')
+        assert response.status_code == 204
+        assert response.headers.get('Access-Control-Allow-Origin') == '*'
+
+
+class TestSecurityHeaders:
+    """Defence-in-depth response headers added globally via after_request."""
+
+    def test_security_headers_present(self, client):
+        response = client.get('/health')
+        assert response.headers.get('X-Content-Type-Options') == 'nosniff'
+        assert response.headers.get('X-Frame-Options') == 'SAMEORIGIN'
+        assert response.headers.get('Referrer-Policy') == 'no-referrer'
+
+    def test_hsts_set_when_forwarded_proto_https(self, client):
+        response = client.get('/health', headers={'X-Forwarded-Proto': 'https'})
+        assert 'max-age=' in response.headers.get('Strict-Transport-Security', '')
+
+    def test_hsts_absent_over_plain_http(self, client):
+        response = client.get('/health')
+        assert 'Strict-Transport-Security' not in response.headers
+
+
+class TestMetrics:
+    """Prometheus metrics exposition endpoint."""
+
+    def test_metrics_endpoint(self, client):
+        response = client.get('/metrics')
+        assert response.status_code == 200
+        assert 'text/plain' in response.content_type
+        body = response.get_data(as_text=True)
+        assert 'tvr_up 1' in body
+        assert '# TYPE tvr_up gauge' in body
+        assert 'tvr_active_recordings' in body
+        assert 'tvr_streams_dir_free_bytes' in body
 
 
 # =============================================================================

@@ -28,6 +28,7 @@ from app.state import (
     get_srt_buffer_manager
 )
 import app.state as app_state
+from app.utils.atomic_json import write_json_atomic, read_json
 from app.websocket.broadcast import broadcast
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,10 @@ settings_bp = Blueprint('settings', __name__)
 
 # Global settings that can be modified at runtime
 server_settings = SERVER_SETTINGS.copy()
+
+# Runtime settings persist here so operational tuning (reconnect/stall/standby/
+# SRT buffer/etc.) survives a restart instead of silently resetting to defaults.
+_SERVER_SETTINGS_FILE = os.path.join(DATA_DIR, 'server_settings.json')
 
 
 def get_auto_record_enabled():
@@ -79,6 +84,42 @@ def _validate_setting(key: str, value):
             return None, f"Setting '{key}' must be a string"
 
     return value, None
+
+
+def _persist_server_settings():
+    """Atomically write the current runtime settings to disk."""
+    try:
+        write_json_atomic(_SERVER_SETTINGS_FILE, server_settings)
+    except Exception as e:
+        logger.warning(f"Could not persist server settings: {e}")
+
+
+def _load_server_settings():
+    """Load persisted runtime settings over the defaults (schema-validated).
+
+    Unknown/invalid keys are ignored so a stale or tampered file can't push the
+    server into an invalid state. Mutates the existing dict in place so modules
+    that already imported ``server_settings`` observe the loaded values.
+    """
+    saved = read_json(_SERVER_SETTINGS_FILE, default=None)
+    if not isinstance(saved, dict):
+        return
+    applied = 0
+    for key, value in saved.items():
+        if key not in server_settings:
+            continue
+        coerced, error = _validate_setting(key, value)
+        if error:
+            logger.warning(f"Ignoring persisted setting '{key}': {error}")
+            continue
+        server_settings[key] = coerced
+        applied += 1
+    if applied:
+        logger.info(f"Loaded {applied} persisted server setting(s)")
+
+
+# Apply any persisted settings at import time (defaults are already in place).
+_load_server_settings()
 
 
 def _srt_settings_file():
@@ -232,6 +273,9 @@ def update_settings():
         if errors and not updated:
             return jsonify({'error': '; '.join(errors)}), 400
 
+        if updated:
+            _persist_server_settings()
+
         broadcast('settings_updated', {'settings': server_settings})
 
         result = {
@@ -381,8 +425,7 @@ def update_srt_settings():
             logger.info(f"SRT setting updated: {key} = {value} (was {old_value})")
 
         # Save updated settings
-        with open(settings_file, 'w') as f:
-            json.dump(current_settings, f, indent=2)
+        write_json_atomic(settings_file, current_settings)
 
         # Generate example URL with these settings
         example_params = []
@@ -502,9 +545,7 @@ def update_abr_settings():
             return jsonify({'error': '; '.join(errors)}), 400
 
         # Persist
-        os.makedirs(DATA_DIR, exist_ok=True)
-        with open(settings_file, 'w') as f:
-            json.dump(current, f, indent=2)
+        write_json_atomic(settings_file, current)
         logger.info(f"ABR settings updated: {current}")
 
         # Apply to running ABR processes by rebuilding renditions and restarting

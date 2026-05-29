@@ -9,10 +9,11 @@ Health check API endpoints
 """
 from flask import Blueprint, jsonify
 from datetime import datetime, timezone
+import os
 import logging
 import requests as http_requests
 from app import state
-from app.config import MEDIAMTX_API_URL
+from app.config import MEDIAMTX_API_URL, DATA_DIR, STREAMS_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,14 @@ def _check_mediamtx():
         return False
 
 
+def _dir_writable(path: str) -> bool:
+    """True if path is an existing, writable directory."""
+    try:
+        return os.path.isdir(path) and os.access(path, os.W_OK)
+    except OSError:
+        return False
+
+
 @health_bp.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
@@ -76,6 +85,28 @@ def health_check():
     except Exception as e:
         logger.error(f"Health check error: {e}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@health_bp.route('/ready', methods=['GET'])
+def readiness_check():
+    """Readiness probe (distinct from /health liveness).
+
+    Returns 200 only when the service can actually serve traffic: MediaMTX
+    reachable AND the data/streams directories writable. Returns 503 otherwise
+    so an orchestrator/load-balancer routes around a not-ready instance.
+    """
+    mediamtx_ok = _check_mediamtx()
+    data_ok = _dir_writable(DATA_DIR)
+    streams_ok = _dir_writable(STREAMS_DIR)
+    ready = mediamtx_ok and data_ok and streams_ok
+    payload = {
+        'ready': ready,
+        'mediamtx': 'up' if mediamtx_ok else 'down',
+        'dataDirWritable': data_ok,
+        'streamsDirWritable': streams_ok,
+        'timestamp': datetime.now(timezone.utc).isoformat(),
+    }
+    return jsonify(payload), (200 if ready else 503)
 
 
 @health_bp.route('/api/status', methods=['GET'])

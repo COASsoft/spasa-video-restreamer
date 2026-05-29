@@ -15,10 +15,10 @@ from flask_cors import CORS
 from flask_socketio import SocketIO
 
 # Import configuration and state
-from app.config import SECRET_KEY, PORT, CORS_ORIGINS, LOG_LEVEL, LOGS_DIR, LOG_MAX_BYTES, LOG_BACKUP_COUNT
+from app.config import SECRET_KEY, PORT, CORS_ORIGINS, LOG_LEVEL, LOGS_DIR, LOG_MAX_BYTES, LOG_BACKUP_COUNT, validate_runtime_config
 
 # Import blueprints
-from app.api import health_bp, streams_bp, recordings_bp, settings_bp, utils_bp, test_bp, hls_bp, auth_bp, tls_bp
+from app.api import health_bp, streams_bp, recordings_bp, settings_bp, utils_bp, test_bp, hls_bp, auth_bp, tls_bp, metrics_bp
 
 # Import websocket handlers
 from app.websocket import set_socketio, register_handlers
@@ -53,6 +53,10 @@ def create_app():
     setup_logging()
     logger = logging.getLogger(__name__)
     logger.info("Starting TAK Video Restreamer")
+
+    # Fail-closed validation of security-critical configuration (default
+    # password, etc.). Raises ConfigError and aborts startup on misconfig.
+    validate_runtime_config()
     
     # Initialize authentication
     init_auth(app)
@@ -110,6 +114,7 @@ def create_app():
     app.register_blueprint(hls_bp)
     app.register_blueprint(auth_bp)
     app.register_blueprint(tls_bp)
+    app.register_blueprint(metrics_bp)
 
     # Apply rate limiting to login endpoint
     if app.limiter:
@@ -148,6 +153,20 @@ def create_app():
             return redirect(url_for('login_page'))
         return None
     
+    # Security response headers (defence-in-depth; safe for media fetches).
+    @app.after_request
+    def _security_headers(response):
+        response.headers.setdefault('X-Content-Type-Options', 'nosniff')
+        response.headers.setdefault('X-Frame-Options', 'SAMEORIGIN')
+        response.headers.setdefault('Referrer-Policy', 'no-referrer')
+        # HSTS is only honoured by browsers over HTTPS; set it when the edge
+        # (nginx) terminated TLS or the request is otherwise secure.
+        if request.headers.get('X-Forwarded-Proto', '').lower() == 'https' or request.is_secure:
+            response.headers.setdefault(
+                'Strict-Transport-Security', 'max-age=31536000; includeSubDomains'
+            )
+        return response
+
     # Static file routes (protected by auth)
     @app.route('/login')
     def login_page():

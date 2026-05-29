@@ -24,19 +24,16 @@ from app.state import active_recordings, thumbnail_executor, post_processing_que
 from app.api.settings import server_settings
 from app.utils.codec_detection import detect_stream_codec, analyze_recording
 from app.utils.thumbnail import generate_thumbnail
+from app.utils.validation import is_valid_stream_name
 from app.websocket.broadcast import broadcast
 
 logger = logging.getLogger(__name__)
 
 recordings_bp = Blueprint('recordings', __name__)
 
-# Stream name validation regex - only safe characters
-STREAM_NAME_PATTERN = re.compile(r'^[a-zA-Z0-9_-]+$')
-
-
 def validate_stream_name(stream_name: str) -> bool:
-    """Validate stream name contains only safe characters"""
-    return bool(STREAM_NAME_PATTERN.match(stream_name)) and len(stream_name) <= 64
+    """Validate stream name contains only safe characters (centralized rules)."""
+    return is_valid_stream_name(stream_name)
 
 
 def validate_filename(filename: str) -> bool:

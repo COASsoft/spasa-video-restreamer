@@ -16,8 +16,9 @@ from .test import test_bp
 from .hls import hls_bp
 from .auth_api import auth_bp
 from .tls_api import tls_bp
+from .metrics import metrics_bp
 
 __all__ = [
     'health_bp', 'streams_bp', 'recordings_bp', 'settings_bp',
-    'utils_bp', 'test_bp', 'hls_bp', 'auth_bp', 'tls_bp',
+    'utils_bp', 'test_bp', 'hls_bp', 'auth_bp', 'tls_bp', 'metrics_bp',
 ]

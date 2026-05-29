@@ -14,13 +14,13 @@ Handles:
 - RTSPS + HTTPS configuration
 """
 import os
-import json
 import subprocess
 import shutil
 import logging
 from datetime import datetime, timezone
 
 from app.config import DATA_DIR
+from app.utils.atomic_json import write_json_atomic, read_json
 
 logger = logging.getLogger(__name__)
 
@@ -41,19 +41,14 @@ DEFAULT_TLS_SETTINGS = {
 
 def _load_tls_settings() -> dict:
     settings = dict(DEFAULT_TLS_SETTINGS)
-    try:
-        if os.path.exists(TLS_SETTINGS_FILE):
-            with open(TLS_SETTINGS_FILE, 'r') as f:
-                settings.update(json.load(f))
-    except Exception as e:
-        logger.error(f"Error loading TLS settings: {e}")
+    saved = read_json(TLS_SETTINGS_FILE, default=None)
+    if isinstance(saved, dict):
+        settings.update(saved)
     return settings
 
 
 def _save_tls_settings(settings: dict):
-    os.makedirs(DATA_DIR, exist_ok=True)
-    with open(TLS_SETTINGS_FILE, 'w') as f:
-        json.dump(settings, f, indent=2)
+    write_json_atomic(TLS_SETTINGS_FILE, settings)
 
 
 def get_tls_settings() -> dict:

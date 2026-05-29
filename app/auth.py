@@ -14,10 +14,6 @@ Credentials come from environment variables:
 API keys are stored in DATA_DIR/api_keys.json
 """
 import os
-import json
-import hmac
-import secrets
-import hashlib
 import logging
 import functools
 from datetime import datetime, timezone
@@ -26,6 +22,8 @@ from flask import request, jsonify, redirect, url_for, session
 from flask_login import LoginManager, UserMixin, login_user, logout_user, current_user, login_required
 
 from app.config import DATA_DIR
+from app.utils.atomic_json import write_json_atomic, read_json
+from app.utils.crypto import sha256_hex, constant_time_equals, generate_token
 
 logger = logging.getLogger(__name__)
 
@@ -61,8 +59,8 @@ def _check_credentials(username, password):
     """Return User or None. Uses constant-time comparison to resist timing attacks."""
     if not isinstance(username, str) or not isinstance(password, str):
         return None
-    user_ok = hmac.compare_digest(username.encode('utf-8'), ADMIN_USERNAME.encode('utf-8'))
-    pass_ok = hmac.compare_digest(password.encode('utf-8'), ADMIN_PASSWORD.encode('utf-8'))
+    user_ok = constant_time_equals(username, ADMIN_USERNAME)
+    pass_ok = constant_time_equals(password, ADMIN_PASSWORD)
     if user_ok and pass_ok:
         return _admin_user
     return None
@@ -74,31 +72,29 @@ def _check_credentials(username, password):
 
 _API_KEYS_FILE = os.path.join(DATA_DIR, 'api_keys.json')
 
+# In-memory cache of valid key hashes, invalidated by the file's mtime so we
+# don't read+parse the JSON on every authenticated request. The mtime check
+# also makes the cache correct across multiple workers (each reloads when the
+# file changes after a create/revoke).
+_api_key_cache = {'mtime': None, 'hashes': frozenset()}
+
 
 def _load_api_keys() -> dict:
     """Return {key_hash: {name, created}} dict."""
-    try:
-        if os.path.exists(_API_KEYS_FILE):
-            with open(_API_KEYS_FILE, 'r') as f:
-                return json.load(f)
-    except Exception as e:
-        logger.error(f"Error loading API keys: {e}")
-    return {}
+    return read_json(_API_KEYS_FILE, default={}) or {}
 
 
 def _save_api_keys(keys: dict):
-    os.makedirs(DATA_DIR, exist_ok=True)
-    with open(_API_KEYS_FILE, 'w') as f:
-        json.dump(keys, f, indent=2)
+    write_json_atomic(_API_KEYS_FILE, keys)
 
 
 def _hash_key(raw_key: str) -> str:
-    return hashlib.sha256(raw_key.encode()).hexdigest()
+    return sha256_hex(raw_key)
 
 
 def generate_api_key(name: str) -> str:
     """Generate a new API key, persist the hash, return the raw key."""
-    raw_key = f"tvr_{secrets.token_hex(24)}"
+    raw_key = generate_token(24, prefix='tvr_')
     keys = _load_api_keys()
     keys[_hash_key(raw_key)] = {
         'name': name,
@@ -128,9 +124,17 @@ def list_api_keys() -> list:
 
 
 def _validate_api_key(raw_key: str) -> bool:
-    """Check if a raw API key is valid."""
-    h = _hash_key(raw_key)
-    return h in _load_api_keys()
+    """Check if a raw API key is valid (cached, refreshed on file change)."""
+    if not raw_key:
+        return False
+    try:
+        mtime = os.path.getmtime(_API_KEYS_FILE)
+    except OSError:
+        mtime = None
+    if mtime != _api_key_cache['mtime']:
+        _api_key_cache['hashes'] = frozenset(_load_api_keys().keys())
+        _api_key_cache['mtime'] = mtime
+    return _hash_key(raw_key) in _api_key_cache['hashes']
 
 
 # ---------------------------------------------------------------------------

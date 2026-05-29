@@ -15,7 +15,6 @@ Persistence: standby_streams.json in DATA_DIR
 Settings: standby_enabled, standby_timeout_minutes in server settings
 """
 import os
-import json
 import time
 import threading
 import logging
@@ -23,6 +22,7 @@ from datetime import datetime, timezone
 from typing import Dict, Optional
 
 from app.config import DATA_DIR
+from app.utils.atomic_json import write_json_atomic, read_json
 from app.websocket.broadcast import broadcast
 
 logger = logging.getLogger(__name__)
@@ -172,22 +172,16 @@ class StandbyManager:
     def _persist(self):
         """Write current state to disk (caller must hold lock)."""
         try:
-            os.makedirs(DATA_DIR, exist_ok=True)
-            with open(_STANDBY_FILE, 'w') as f:
-                json.dump(self._streams, f, indent=2)
+            write_json_atomic(_STANDBY_FILE, self._streams)
         except Exception as e:
             logger.error(f"Error persisting standby streams: {e}")
 
     def _load(self):
         """Load state from disk."""
-        try:
-            if os.path.exists(_STANDBY_FILE):
-                with open(_STANDBY_FILE, 'r') as f:
-                    self._streams = json.load(f)
-                logger.info(f"Loaded {len(self._streams)} standby stream entries")
-        except Exception as e:
-            logger.error(f"Error loading standby streams: {e}")
-            self._streams = {}
+        loaded = read_json(_STANDBY_FILE, default=None)
+        self._streams = loaded if isinstance(loaded, dict) else {}
+        if loaded:
+            logger.info(f"Loaded {len(self._streams)} standby stream entries")
 
 
 # Module singleton
