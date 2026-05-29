@@ -38,17 +38,18 @@ from app import create_app
 
 @pytest.fixture
 def client():
-    """Create an authenticated test client.
+    """Create an authenticated test client with FULL (admin) privileges.
 
-    The app protects all /api/* and page routes via a before_request hook.
-    We authenticate with a freshly minted API key (decoupled from the admin
-    password) set as a default header on every request, so endpoint behaviour
-    — not the auth gate — is what gets exercised.
+    The app protects all /api/* and page routes via a before_request hook and a
+    centralized RBAC table. We authenticate with a freshly minted admin API key
+    set as a default header on every request, so endpoint behaviour — not the
+    auth/RBAC gate — is what gets exercised. (Role enforcement is covered by the
+    dedicated viewer/operator fixtures and TestRBAC.)
     """
     app = create_app()
     app.config['TESTING'] = True
     from app import auth
-    raw_key = auth.generate_api_key('pytest')
+    raw_key = auth.generate_api_key('pytest', role='admin')
     with app.test_client() as client:
         client.environ_base['HTTP_X_API_KEY'] = raw_key
         yield client
@@ -60,6 +61,30 @@ def anon_client():
     app = create_app()
     app.config['TESTING'] = True
     with app.test_client() as client:
+        yield client
+
+
+@pytest.fixture
+def viewer_client():
+    """Authenticated test client with the read-only 'viewer' role."""
+    app = create_app()
+    app.config['TESTING'] = True
+    from app import auth
+    raw_key = auth.generate_api_key('pytest-viewer', role='viewer')
+    with app.test_client() as client:
+        client.environ_base['HTTP_X_API_KEY'] = raw_key
+        yield client
+
+
+@pytest.fixture
+def operator_client():
+    """Authenticated test client with the 'operator' role."""
+    app = create_app()
+    app.config['TESTING'] = True
+    from app import auth
+    raw_key = auth.generate_api_key('pytest-operator', role='operator')
+    with app.test_client() as client:
+        client.environ_base['HTTP_X_API_KEY'] = raw_key
         yield client
 
 
@@ -912,6 +937,147 @@ class TestErrorHandling:
                             data='invalid json',
                             content_type='application/json')
         assert response.status_code == 405
+
+
+# =============================================================================
+# RBAC — centralized role gate (Phase 1 infra "B")
+# =============================================================================
+
+class TestRBAC:
+    """Role enforcement via the centralized before_request table."""
+
+    def test_viewer_can_read(self, viewer_client):
+        with patch('requests.get') as mock_get:
+            mock_get.return_value = MagicMock(status_code=200, json=lambda: {'items': {}})
+            assert viewer_client.get('/api/streams').status_code == 200
+
+    def test_viewer_cannot_create_stream(self, viewer_client):
+        # Mutating route → operator+. Viewer is rejected at the gate (403) before
+        # the view runs, so no MediaMTX call is needed.
+        r = viewer_client.post('/api/streams/foo', json={})
+        assert r.status_code == 403
+
+    def test_operator_can_create_pull_stream(self, operator_client):
+        with patch('app.api.streams._start_pull_impl') as mock_pull, \
+             patch('app.api.streams.broadcast'):
+            r = operator_client.post('/api/streams/foo/pull',
+                                     json={'sourceUrl': 'rtsp://example.com/s'},
+                                     content_type='application/json')
+        assert r.status_code == 200
+        mock_pull.assert_called_once()
+
+    def test_operator_cannot_write_settings(self, operator_client):
+        # Global settings POST is admin-only.
+        r = operator_client.post('/api/settings', json={'segment_duration': 30})
+        assert r.status_code == 403
+
+    def test_admin_can_write_settings(self, client):
+        # The default `client` fixture is admin.
+        with patch('app.api.settings._persist_server_settings'), \
+             patch('app.api.settings.broadcast'):
+            r = client.post('/api/settings', json={'segment_duration': 30})
+        assert r.status_code == 200
+
+    def test_operator_cannot_manage_api_keys(self, operator_client):
+        r = operator_client.post('/api/auth/keys', json={'name': 'x'})
+        assert r.status_code == 403
+
+    def test_unlisted_mutating_route_defaults_to_operator(self, viewer_client):
+        # Default-deny: a route not in the table requires operator for non-GET.
+        r = viewer_client.post('/api/some-brand-new-endpoint', json={})
+        assert r.status_code == 403  # 403 (not 404) proves the gate denies first
+
+    def test_unauthenticated_api_is_401(self, anon_client):
+        assert anon_client.get('/api/streams').status_code == 401
+
+
+# =============================================================================
+# HLS fail-closed access control + signed URLs
+# =============================================================================
+
+class TestHLSAccessControl:
+    """HLS playback is fail-closed: auth OR a valid signed URL."""
+
+    def _write_master(self, stream='sigstream'):
+        from app.services.abr import HLS_OUTPUT_DIR
+        sd = os.path.join(HLS_OUTPUT_DIR, stream)
+        os.makedirs(sd, exist_ok=True)
+        with open(os.path.join(sd, 'master.m3u8'), 'w') as f:
+            f.write('#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000\nv0/index.m3u8\n')
+        return stream
+
+    def test_anonymous_hls_denied(self, anon_client):
+        assert anon_client.get('/hls/anystream/master.m3u8').status_code == 403
+
+    def test_authenticated_hls_allowed(self, client):
+        stream = self._write_master('authstream')
+        assert client.get(f'/hls/{stream}/master.m3u8').status_code == 200
+
+    def test_token_endpoint_then_anon_fetch(self, viewer_client, anon_client):
+        stream = self._write_master('tokstream')
+        r = viewer_client.get(f'/api/streams/{stream}/hls-token')
+        assert r.status_code == 200
+        master_url = json.loads(r.data)['master_url']
+        # An anonymous client can fetch the signed URL.
+        resp = anon_client.get(master_url)
+        assert resp.status_code == 200
+        # And the signature is propagated to the child playlist reference.
+        assert 'v0/index.m3u8?exp=' in resp.get_data(as_text=True)
+
+    def test_expired_signature_denied(self, anon_client):
+        from app.api.hls import _sign_stream
+        exp = 1  # epoch → long expired
+        sig = _sign_stream('expstream', exp)
+        r = anon_client.get(f'/hls/expstream/master.m3u8?exp={exp}&sig={sig}')
+        assert r.status_code == 403
+
+    def test_tampered_signature_denied(self, anon_client):
+        r = anon_client.get('/hls/x/master.m3u8?exp=9999999999&sig=deadbeef')
+        assert r.status_code == 403
+
+    def test_signature_is_stream_scoped(self, viewer_client, anon_client):
+        # A signature minted for stream A must not authorize stream B.
+        r = viewer_client.get('/api/streams/streamA/hls-token')
+        master_a = json.loads(r.data)['master_url']
+        qs = master_a.split('?', 1)[1]
+        assert anon_client.get(f'/hls/streamB/master.m3u8?{qs}').status_code == 403
+
+    def test_proxy_preflight_still_open(self, anon_client):
+        r = anon_client.options('/api/hls/proxy/teststream/index.m3u8')
+        assert r.status_code == 204
+
+
+# =============================================================================
+# MediaMTX API client authentication
+# =============================================================================
+
+class TestMediaMTXClientAuth:
+    """The client injects credentials into every request when configured."""
+
+    def test_no_auth_by_default(self):
+        from app.services.mediamtx import MediaMTXClient
+        with patch('app.services.mediamtx.requests.get') as mock_get:
+            mock_get.return_value = MagicMock(status_code=200, json=lambda: {})
+            MediaMTXClient('http://mtx:8889').list_paths()
+            _, kwargs = mock_get.call_args
+            assert 'auth' not in kwargs
+            assert not kwargs.get('headers')
+
+    def test_basic_auth_when_user_set(self):
+        from app.services.mediamtx import MediaMTXClient
+        with patch('app.services.mediamtx.requests.get') as mock_get:
+            mock_get.return_value = MagicMock(status_code=200, json=lambda: {})
+            MediaMTXClient('http://mtx:8889', user='u', password='p').list_paths()
+            _, kwargs = mock_get.call_args
+            assert kwargs.get('auth') == ('u', 'p')
+
+    def test_bearer_token_when_token_set(self):
+        from app.services.mediamtx import MediaMTXClient
+        with patch('app.services.mediamtx.requests.get') as mock_get:
+            mock_get.return_value = MagicMock(status_code=200, json=lambda: {})
+            MediaMTXClient('http://mtx:8889', token='abc123').list_paths()
+            _, kwargs = mock_get.call_args
+            assert kwargs['headers']['Authorization'] == 'Bearer abc123'
 
 
 # =============================================================================

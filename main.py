@@ -17,7 +17,8 @@ from datetime import datetime, timezone
 import os
 
 from app import create_app
-from app.config import PORT, MEDIAMTX_API_URL, MEDIAMTX_RTSP_URL, STREAMS_DIR, SRT_BUFFER_AVAILABLE
+from app.config import (PORT, MEDIAMTX_API_URL, MEDIAMTX_RTSP_URL, STREAMS_DIR, SRT_BUFFER_AVAILABLE,
+                        MEDIAMTX_API_USER, MEDIAMTX_API_PASS, MEDIAMTX_API_TOKEN, MEDIAMTX_API_AUTH)
 from app.state import (
     active_recordings, active_pull_streams, thumbnail_executor, post_process_executor,
     known_streams, get_srt_buffer_manager, recording_lock
@@ -85,7 +86,8 @@ def monitor_streams_for_auto_record():
 
     logger.info("Stream monitor thread started")
 
-    _blocklist_mtx = MediaMTXClient(MEDIAMTX_API_URL)
+    _blocklist_mtx = MediaMTXClient(MEDIAMTX_API_URL, user=MEDIAMTX_API_USER,
+                                    password=MEDIAMTX_API_PASS, token=MEDIAMTX_API_TOKEN)
 
     while True:
         try:
@@ -96,7 +98,7 @@ def monitor_streams_for_auto_record():
 
             if app_state.auto_record_enabled:
                 # Get current streams from MediaMTX
-                response = requests.get(f'{MEDIAMTX_API_URL}/v3/paths/list', timeout=5)
+                response = requests.get(f'{MEDIAMTX_API_URL}/v3/paths/list', timeout=5, **MEDIAMTX_API_AUTH)
                 if response.status_code == 200:
                     paths_data = response.json()
                     items = paths_data if isinstance(paths_data, list) else paths_data.get('items', {})

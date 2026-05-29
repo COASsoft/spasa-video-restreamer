@@ -13,7 +13,7 @@ import os
 import logging
 import requests as http_requests
 from app import state
-from app.config import MEDIAMTX_API_URL, DATA_DIR, STREAMS_DIR
+from app.config import MEDIAMTX_API_URL, DATA_DIR, STREAMS_DIR, MEDIAMTX_API_AUTH
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +49,7 @@ def _check_srt_buffer_availability():
 def _check_mediamtx():
     """Check if MediaMTX API is reachable."""
     try:
-        resp = http_requests.get(f'{MEDIAMTX_API_URL}/v3/paths/list', timeout=3)
+        resp = http_requests.get(f'{MEDIAMTX_API_URL}/v3/paths/list', timeout=3, **MEDIAMTX_API_AUTH)
         return resp.status_code == 200
     except Exception:
         return False

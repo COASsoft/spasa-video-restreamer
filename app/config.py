@@ -121,6 +121,29 @@ SECRET_KEY = _resolve_secret_key()
 MEDIAMTX_API_URL = os.environ.get('MEDIAMTX_API_URL', 'http://127.0.0.1:8889')
 MEDIAMTX_RTSP_URL = os.environ.get('MEDIAMTX_RTSP_URL', 'rtsp://127.0.0.1:8554')
 
+# Optional credentials the app uses to authenticate to the MediaMTX control API.
+# Unset = no auth (back-compat with an open localhost-bound API). Set these once the
+# MediaMTX API requires credentials (Phase 1 infra "B"): a token takes precedence over
+# user/pass and is sent as a Bearer header; user/pass is sent as HTTP Basic.
+MEDIAMTX_API_USER = os.environ.get('MEDIAMTX_API_USER', '')
+MEDIAMTX_API_PASS = os.environ.get('MEDIAMTX_API_PASS', '')
+MEDIAMTX_API_TOKEN = os.environ.get('MEDIAMTX_API_TOKEN', '')
+
+
+def _mediamtx_auth_kwargs() -> dict:
+    """requests kwargs (auth=/headers=) for authenticating to the MediaMTX API.
+    Empty when no credentials are configured (open-API back-compat). Reused by the
+    few ad-hoc ``requests.get(MEDIAMTX_API_URL/v3/...)`` call sites outside the client."""
+    if MEDIAMTX_API_TOKEN:
+        return {'headers': {'Authorization': f'Bearer {MEDIAMTX_API_TOKEN}'}}
+    if MEDIAMTX_API_USER:
+        return {'auth': (MEDIAMTX_API_USER, MEDIAMTX_API_PASS)}
+    return {}
+
+
+# Ready-made requests kwargs for ad-hoc MediaMTX API calls (see direct call sites).
+MEDIAMTX_API_AUTH = _mediamtx_auth_kwargs()
+
 # CORS Configuration
 CORS_ORIGINS = os.environ.get('CORS_ORIGINS', '*')
 
@@ -129,6 +152,43 @@ CORS_ORIGINS = os.environ.get('CORS_ORIGINS', '*')
 # reachable without auth — acceptable for the VPN-only deployment. Set it (or
 # restrict /metrics at the nginx edge) to lock the endpoint down.
 METRICS_TOKEN = os.environ.get('METRICS_TOKEN', '')
+
+# ---------------------------------------------------------------------------
+# mTLS / RBAC (Phase 1 infra "B")
+# ---------------------------------------------------------------------------
+# Role names are duplicated here as literals (instead of importing app.auth) to
+# avoid an import cycle: app.auth imports from app.config, never the reverse.
+_VALID_ROLES = ('viewer', 'operator', 'admin')
+
+# When True, the app honours mTLS client-cert identity injected by the trusted
+# reverse proxy (nginx). The X-SSL-Client-* headers are trusted ONLY when the
+# request also carries a matching PROXY_SHARED_SECRET (anti-spoof), so this is
+# safe even on a shared docker network.
+MTLS_ENABLED = _env_bool('MTLS_ENABLED', False)
+# Shared secret nginx sends as X-Proxy-Auth. Required when MTLS_ENABLED (the app
+# refuses to start otherwise — see validate_runtime_config). Without it, no
+# X-SSL-Client-* header is ever honoured.
+PROXY_SHARED_SECRET = os.environ.get('PROXY_SHARED_SECRET', '')
+# cert CN/DN → role map (atomic JSON). Schema:
+#   {"cn_roles": {<cn>: <role>}, "dn_roles": {<dn>: <role>}, "default_role": <role|null>}
+CERT_ROLE_MAP_FILE = os.environ.get('CERT_ROLE_MAP_FILE', os.path.join(DATA_DIR, 'cert_roles.json'))
+# Fallback role for an authenticated-but-unmapped client cert when the map file
+# omits "default_role". None = fail-closed (no implicit role → denied). Military
+# default: every identity must be explicitly granted a role. Flip to 'viewer'
+# only once SPASA's per-feed GroupVector/classification ACL is wired in.
+CERT_DEFAULT_ROLE = os.environ.get('CERT_DEFAULT_ROLE') or None
+# Role granted to legacy API keys that predate role-aware keys (no "role" field).
+API_KEY_DEFAULT_ROLE = os.environ.get('API_KEY_DEFAULT_ROLE', 'viewer')
+
+# ---------------------------------------------------------------------------
+# HLS access control (Phase 1 infra "B")
+# ---------------------------------------------------------------------------
+# When True, HLS playback is fail-closed: each HLS view requires either an
+# authenticated session/API-key/mTLS identity, OR a valid unexpired HMAC-signed
+# URL (?exp=&sig=). Default ON; the in-browser player carries the session cookie.
+HLS_REQUIRE_AUTH = _env_bool('HLS_REQUIRE_AUTH', True)
+# TTL (seconds) for signed HLS URLs issued by /api/streams/<name>/hls-token.
+HLS_URL_TTL = _env_int('HLS_URL_TTL', 3600, minimum=60, maximum=86400)
 
 # Logging Configuration
 LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()
@@ -182,6 +242,21 @@ def validate_runtime_config() -> None:
             "ALLOW_DEFAULT_PASSWORD=true to override.)"
         )
 
+    # mTLS must not be enabled without the anti-spoof shared secret, or any
+    # process on the docker network could forge X-SSL-Client-* identity headers.
+    if MTLS_ENABLED and not PROXY_SHARED_SECRET and not DEV_MODE:
+        errors.append(
+            "MTLS_ENABLED is set but PROXY_SHARED_SECRET is empty. The shared "
+            "secret is required to trust the nginx-injected X-SSL-Client-* headers "
+            "(anti-spoof). Set PROXY_SHARED_SECRET."
+        )
+
+    # Role config must reference real roles, else access decisions are undefined.
+    if CERT_DEFAULT_ROLE is not None and CERT_DEFAULT_ROLE not in _VALID_ROLES:
+        errors.append(f"CERT_DEFAULT_ROLE invalid: {CERT_DEFAULT_ROLE!r} (expected one of {_VALID_ROLES} or unset).")
+    if API_KEY_DEFAULT_ROLE not in _VALID_ROLES:
+        errors.append(f"API_KEY_DEFAULT_ROLE invalid: {API_KEY_DEFAULT_ROLE!r} (expected one of {_VALID_ROLES}).")
+
     if errors:
         msg = "Insecure/invalid configuration — refusing to start:\n  - " + "\n  - ".join(errors)
         logger.critical(msg)
@@ -190,6 +265,12 @@ def validate_runtime_config() -> None:
     # Non-fatal posture warnings (tightened further in later phases).
     if CORS_ORIGINS == '*' and not DEV_MODE:
         logger.warning("CORS_ORIGINS is '*' (all origins). Set an explicit allow-list for production.")
+    if not HLS_REQUIRE_AUTH and not DEV_MODE:
+        logger.warning("HLS_REQUIRE_AUTH is off — HLS playback is unauthenticated. Leave it on outside a lab.")
+    if MEDIAMTX_API_USER and not MEDIAMTX_API_PASS and not MEDIAMTX_API_TOKEN:
+        logger.warning("MEDIAMTX_API_USER is set without MEDIAMTX_API_PASS/TOKEN — MediaMTX API auth may fail.")
+    if PROXY_SHARED_SECRET and not MTLS_ENABLED:
+        logger.warning("PROXY_SHARED_SECRET is set but MTLS_ENABLED is off — mTLS identity headers will be ignored.")
 
 
 # Server Settings - Recording & Stream Management

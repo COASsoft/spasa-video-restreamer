@@ -20,7 +20,7 @@ import requests as http_requests
 from flask import Blueprint, Response, request
 
 from app import state
-from app.config import STREAMS_DIR, MEDIAMTX_API_URL, METRICS_TOKEN
+from app.config import STREAMS_DIR, MEDIAMTX_API_URL, METRICS_TOKEN, MEDIAMTX_API_AUTH
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +38,7 @@ def _mediamtx_up() -> int:
     if _mediamtx_up_cache['ts'] and (now - _mediamtx_up_cache['ts']) < _MEDIAMTX_UP_TTL:
         return _mediamtx_up_cache['value']
     try:
-        r = http_requests.get(f'{MEDIAMTX_API_URL}/v3/paths/list', timeout=2)
+        r = http_requests.get(f'{MEDIAMTX_API_URL}/v3/paths/list', timeout=2, **MEDIAMTX_API_AUTH)
         value = 1 if r.status_code == 200 else 0
     except Exception:
         value = 0

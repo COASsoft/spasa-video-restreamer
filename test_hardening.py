@@ -231,30 +231,49 @@ class TestApiKeyCache:
         from app import auth
         monkeypatch.setattr(auth, '_API_KEYS_FILE', str(tmp_path / 'api_keys.json'))
         auth._api_key_cache['mtime'] = None
-        auth._api_key_cache['hashes'] = frozenset()
+        auth._api_key_cache['keys'] = {}
         return auth
 
     def test_generated_key_validates(self, tmp_path, monkeypatch):
         auth = self._patch_keyfile(monkeypatch, tmp_path)
         raw = auth.generate_api_key('test-key')
-        assert auth._validate_api_key(raw) is True
-        assert auth._validate_api_key('tvr_does_not_exist') is False
+        # Now returns the key's metadata dict (truthy) on success, None on failure.
+        assert auth._validate_api_key(raw)
+        assert auth._validate_api_key('tvr_does_not_exist') is None
 
     def test_revoked_key_rejected(self, tmp_path, monkeypatch):
         auth = self._patch_keyfile(monkeypatch, tmp_path)
         raw = auth.generate_api_key('test-key')
         assert auth.revoke_api_key(auth._hash_key(raw)) is True
         auth._api_key_cache['mtime'] = None  # a fresh worker would reload too
-        assert auth._validate_api_key(raw) is False
+        assert auth._validate_api_key(raw) is None
 
     def test_cache_consulted_without_rereading_file(self, tmp_path, monkeypatch):
         auth = self._patch_keyfile(monkeypatch, tmp_path)
         raw = auth.generate_api_key('test-key')
-        assert auth._validate_api_key(raw) is True   # populates cache
+        assert auth._validate_api_key(raw)   # populates cache
         # Tamper the cache only (file unchanged). Unchanged mtime => the cached
-        # (now-empty) set is trusted, proving we don't hit disk every request.
-        auth._api_key_cache['hashes'] = frozenset()
-        assert auth._validate_api_key(raw) is False
+        # (now-empty) map is trusted, proving we don't hit disk every request.
+        auth._api_key_cache['keys'] = {}
+        assert auth._validate_api_key(raw) is None
+
+    def test_generated_key_carries_role(self, tmp_path, monkeypatch):
+        auth = self._patch_keyfile(monkeypatch, tmp_path)
+        raw = auth.generate_api_key('op-key', role='operator')
+        meta = auth._validate_api_key(raw)
+        assert meta and meta['role'] == 'operator'
+
+    def test_legacy_key_without_role_defaults(self, tmp_path, monkeypatch):
+        """A key entry written before role-aware keys (no 'role' field) validates
+        and resolves to API_KEY_DEFAULT_ROLE."""
+        from app.utils.atomic_json import write_json_atomic
+        auth = self._patch_keyfile(monkeypatch, tmp_path)
+        raw = 'tvr_legacy_example_key'
+        write_json_atomic(auth._API_KEYS_FILE,
+                          {auth._hash_key(raw): {'name': 'legacy', 'created': 'x'}})
+        auth._api_key_cache['mtime'] = None
+        meta = auth._validate_api_key(raw)
+        assert meta and meta['role'] == auth.API_KEY_DEFAULT_ROLE
 
 
 # Short-lived / long-lived helper commands for process tests (portable).
@@ -500,3 +519,112 @@ class TestServerSettingsPersistence:
         finally:
             settings_mod.server_settings['stall_threshold_seconds'] = orig_stall
             settings_mod.server_settings['reconnect_delay'] = orig_delay
+
+
+# ---------------------------------------------------------------------------
+# RBAC role hierarchy (Phase 1 infra "B")
+# ---------------------------------------------------------------------------
+
+class TestRoleHierarchy:
+    def test_admin_satisfies_all(self):
+        from app.auth import role_satisfies
+        assert role_satisfies('admin', 'admin')
+        assert role_satisfies('admin', 'operator')
+        assert role_satisfies('admin', 'viewer')
+
+    def test_operator_satisfies_operator_and_below(self):
+        from app.auth import role_satisfies
+        assert role_satisfies('operator', 'operator')
+        assert role_satisfies('operator', 'viewer')
+        assert not role_satisfies('operator', 'admin')
+
+    def test_viewer_only_satisfies_viewer(self):
+        from app.auth import role_satisfies
+        assert role_satisfies('viewer', 'viewer')
+        assert not role_satisfies('viewer', 'operator')
+        assert not role_satisfies('viewer', 'admin')
+
+    def test_unknown_or_none_role_satisfies_nothing(self):
+        from app.auth import role_satisfies
+        assert not role_satisfies(None, 'viewer')
+        assert not role_satisfies('', 'viewer')
+        assert not role_satisfies('superuser', 'viewer')
+
+
+# ---------------------------------------------------------------------------
+# mTLS identity resolution from trusted-proxy headers
+# ---------------------------------------------------------------------------
+
+class TestMtlsIdentity:
+    """_resolve_mtls_identity is exercised through a request context so the Flask
+    `request` proxy is bound. Trust is gated on the X-Proxy-Auth shared secret."""
+
+    def _ctx(self, monkeypatch, tmp_path, headers, *, secret='proxy-secret',
+             cn_roles=None, default_role=None):
+        from app import auth
+        monkeypatch.setattr(auth, 'MTLS_ENABLED', True)
+        monkeypatch.setattr(auth, 'PROXY_SHARED_SECRET', secret)
+        monkeypatch.setattr(auth, 'CERT_DEFAULT_ROLE', default_role)
+        mapfile = str(tmp_path / 'cert_roles.json')
+        write_json_atomic(mapfile, {'cn_roles': cn_roles or {}, 'dn_roles': {},
+                                    'default_role': default_role})
+        monkeypatch.setattr(auth, 'CERT_ROLE_MAP_FILE', mapfile)
+        from flask import Flask
+        app = Flask(__name__)
+        return app.test_request_context(headers=headers), auth
+
+    def test_spoofed_headers_without_secret_ignored(self, monkeypatch, tmp_path):
+        ctx, auth = self._ctx(monkeypatch, tmp_path,
+                              headers={'X-SSL-Client-Verify': 'SUCCESS',
+                                       'X-SSL-Client-CN': 'alice'},
+                              cn_roles={'alice': 'admin'})
+        with ctx:  # no X-Proxy-Auth header → untrusted
+            assert auth._resolve_mtls_identity() is None
+
+    def test_trusted_mapped_cn_gets_role(self, monkeypatch, tmp_path):
+        ctx, auth = self._ctx(monkeypatch, tmp_path,
+                              headers={'X-Proxy-Auth': 'proxy-secret',
+                                       'X-SSL-Client-Verify': 'SUCCESS',
+                                       'X-SSL-Client-CN': 'alice'},
+                              cn_roles={'alice': 'admin'})
+        with ctx:
+            cn, dn, role = auth._resolve_mtls_identity()
+            assert cn == 'alice' and role == 'admin'
+
+    def test_verify_not_success_rejected(self, monkeypatch, tmp_path):
+        ctx, auth = self._ctx(monkeypatch, tmp_path,
+                              headers={'X-Proxy-Auth': 'proxy-secret',
+                                       'X-SSL-Client-Verify': 'FAILED',
+                                       'X-SSL-Client-CN': 'alice'},
+                              cn_roles={'alice': 'admin'})
+        with ctx:
+            assert auth._resolve_mtls_identity() is None
+
+    def test_unmapped_cn_fail_closed(self, monkeypatch, tmp_path):
+        ctx, auth = self._ctx(monkeypatch, tmp_path,
+                              headers={'X-Proxy-Auth': 'proxy-secret',
+                                       'X-SSL-Client-Verify': 'SUCCESS',
+                                       'X-SSL-Client-CN': 'bob'},
+                              cn_roles={'alice': 'admin'}, default_role=None)
+        with ctx:
+            cn, dn, role = auth._resolve_mtls_identity()
+            assert cn == 'bob' and role is None  # authenticated but no role
+
+    def test_unmapped_cn_with_default_role(self, monkeypatch, tmp_path):
+        ctx, auth = self._ctx(monkeypatch, tmp_path,
+                              headers={'X-Proxy-Auth': 'proxy-secret',
+                                       'X-SSL-Client-Verify': 'SUCCESS',
+                                       'X-SSL-Client-CN': 'bob'},
+                              cn_roles={'alice': 'admin'}, default_role='viewer')
+        with ctx:
+            cn, dn, role = auth._resolve_mtls_identity()
+            assert cn == 'bob' and role == 'viewer'
+
+
+class TestMtlsConfigValidation:
+    def test_mtls_without_proxy_secret_fails_closed(self, monkeypatch):
+        monkeypatch.setattr(config, 'MTLS_ENABLED', True)
+        monkeypatch.setattr(config, 'PROXY_SHARED_SECRET', '')
+        monkeypatch.setattr(config, 'DEV_MODE', False)
+        with pytest.raises(ConfigError):
+            config.validate_runtime_config()

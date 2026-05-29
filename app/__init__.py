@@ -8,9 +8,10 @@ This is distributed in the hope that it will be useful, but without any warranty
 Flask application factory
 """
 import os
+import re
 import logging
 from logging.handlers import RotatingFileHandler
-from flask import Flask, send_from_directory, redirect, url_for, request, jsonify
+from flask import Flask, send_from_directory, redirect, url_for, request, jsonify, g
 from flask_cors import CORS
 from flask_socketio import SocketIO
 
@@ -24,7 +25,52 @@ from app.api import health_bp, streams_bp, recordings_bp, settings_bp, utils_bp,
 from app.websocket import set_socketio, register_handlers
 
 # Import auth module
-from app.auth import init_auth, auth_required, _validate_api_key, _check_credentials
+from app.auth import (init_auth, auth_required, resolve_identity, role_satisfies,
+                      audit_log, ROLE_VIEWER, ROLE_OPERATOR, ROLE_ADMIN)
+
+
+# ---------------------------------------------------------------------------
+# Centralized RBAC table (single source of truth for route → minimum role)
+# ---------------------------------------------------------------------------
+# (compiled-regex, allowed-methods | None, min-role). First match wins; matching
+# is on request.path. Keeping this in ONE place makes the authz model auditable
+# and gives a fail-closed default: any /api/* route not listed below requires
+# operator for mutating methods and viewer for reads — so a newly-added mutating
+# endpoint is operator-gated even if the author forgets to register it here.
+_M = None  # "any method"
+_RBAC_RULES = [
+    # --- admin-only ---
+    (re.compile(r'^/api/auth/keys'), _M, ROLE_ADMIN),
+    (re.compile(r'^/api/audit'), _M, ROLE_ADMIN),
+    (re.compile(r'^/api/tls/'), {'POST'}, ROLE_ADMIN),
+    (re.compile(r'^/api/settings/certificates/'), {'POST'}, ROLE_ADMIN),
+    (re.compile(r'^/api/settings$'), {'POST'}, ROLE_ADMIN),
+    # --- operator (mutating ops) ---
+    (re.compile(r'^/api/streams/[^/]+/abr'), {'POST', 'DELETE'}, ROLE_OPERATOR),
+    (re.compile(r'^/api/streams/[^/]+/(stop|pull|stop-pull|standby|record|stop-record|buffer)'), _M, ROLE_OPERATOR),
+    (re.compile(r'^/api/streams/[^/]+/viewers/.+/block'), {'POST'}, ROLE_OPERATOR),
+    (re.compile(r'^/api/streams/[^/]+$'), {'POST', 'DELETE'}, ROLE_OPERATOR),
+    (re.compile(r'^/api/recordings/.+/(keywords|generate-thumbnail)'), {'POST'}, ROLE_OPERATOR),
+    (re.compile(r'^/api/recordings/bulk-delete'), {'POST'}, ROLE_OPERATOR),
+    (re.compile(r'^/api/recordings/.+'), {'DELETE'}, ROLE_OPERATOR),
+    (re.compile(r'^/api/blocked-ips/'), {'DELETE'}, ROLE_OPERATOR),
+    (re.compile(r'^/api/transcode($|/)'), {'POST', 'DELETE'}, ROLE_OPERATOR),
+    (re.compile(r'^/api/klv/'), {'POST'}, ROLE_OPERATOR),
+    (re.compile(r'^/api/test/.+'), {'POST'}, ROLE_OPERATOR),
+    (re.compile(r'^/api/auto-record-toggle'), {'POST'}, ROLE_OPERATOR),
+    (re.compile(r'^/api/settings/(srt|abr|auto-record)'), {'POST'}, ROLE_OPERATOR),
+]
+
+# Methods that never mutate state — the read tier of the catch-all default.
+_READ_METHODS = ('GET', 'HEAD', 'OPTIONS')
+
+
+def _required_role(path, method):
+    """Minimum role for (path, method). Fail-closed default for unlisted routes."""
+    for rx, methods, role in _RBAC_RULES:
+        if rx.match(path) and (methods is None or method in methods):
+            return role
+    return ROLE_VIEWER if method in _READ_METHODS else ROLE_OPERATOR
 
 
 def create_app():
@@ -122,38 +168,41 @@ def create_app():
         if login_view:
             app.limiter.limit("5 per minute")(login_view)
 
-    # Protect ALL API routes except public ones (health, auth login/status, HLS segments).
+    # Protect ALL API routes except public ones (health, auth login/status, HLS).
     # NOTE: /metrics is intentionally outside this gate (root path, for Prometheus
     # scraping); it has its own optional bearer guard (METRICS_TOKEN) and should be
     # restricted at the nginx edge in production.
+    # NOTE: /hls/ and /api/hls/proxy/ stay public HERE but are NOT open — each HLS
+    # view is fail-closed via _hls_access_allowed (auth OR a valid signed URL), so
+    # the gate does not have to special-case signature logic.
     _PUBLIC_PREFIXES = ('/api/health', '/api/auth/login', '/api/auth/status',
                         '/login', '/static/', '/hls/', '/api/hls/proxy/')
-    from flask_login import current_user as _cu
+    _PAGE_ROUTES = ('/', '/recordings', '/settings', '/utils', '/test', '/videowall')
 
     @app.before_request
     def _enforce_auth():
-        path = request.path
+        path, method = request.path, request.method
         # Allow public paths
         for prefix in _PUBLIC_PREFIXES:
             if path.startswith(prefix):
                 return None
-        # Protect /api/* and page routes
-        if path.startswith('/api/') or path in ('/', '/recordings', '/settings', '/utils', '/test'):
-            # Already checked by @auth_required on pages, but belt-and-suspenders for API
-            if _cu.is_authenticated:
-                return None
-            # API key
-            api_key = request.headers.get('X-API-Key')
-            if api_key and _validate_api_key(api_key):
-                return None
-            # Basic auth
-            auth = request.authorization
-            if auth and _check_credentials(auth.username, auth.password):
-                return None
-            # Reject
-            if request.path.startswith('/api/'):
+        is_api = path.startswith('/api/')
+        if not (is_api or path in _PAGE_ROUTES):
+            return None
+        # Authenticate (session > mTLS > API key > Basic), populating g.current_role.
+        if not resolve_identity():
+            if is_api:
                 return jsonify({'error': 'Authentication required'}), 401
             return redirect(url_for('login_page'))
+        # Page routes: any authenticated role may load the SPA shell; the data
+        # calls it makes are individually role-gated below.
+        if not is_api:
+            return None
+        # Enforce the minimum role for this API route.
+        need = _required_role(path, method)
+        if not role_satisfies(g.current_role, need):
+            audit_log('rbac_denied', f'{method} {path} need={need} have={g.current_role}')
+            return jsonify({'error': 'Insufficient privileges'}), 403
         return None
     
     # Security response headers (defence-in-depth; safe for media fetches).

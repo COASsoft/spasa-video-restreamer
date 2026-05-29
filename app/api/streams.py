@@ -18,7 +18,8 @@ from pathlib import Path
 
 from app.config import (
     MEDIAMTX_API_URL, DATA_DIR, FFMPEG_LOG_DIR,
-    PULL_STREAM_BUFFER_SIZE, PULL_STREAM_MAX_DELAY
+    PULL_STREAM_BUFFER_SIZE, PULL_STREAM_MAX_DELAY,
+    MEDIAMTX_API_USER, MEDIAMTX_API_PASS, MEDIAMTX_API_TOKEN, MEDIAMTX_API_AUTH
 )
 from app.state import (
     active_recordings, active_pull_streams, pull_stream_configs,
@@ -39,7 +40,8 @@ import requests as http_requests
 logger = logging.getLogger(__name__)
 
 streams_bp = Blueprint('streams', __name__)
-mediamtx = MediaMTXClient(MEDIAMTX_API_URL)
+mediamtx = MediaMTXClient(MEDIAMTX_API_URL, user=MEDIAMTX_API_USER,
+                          password=MEDIAMTX_API_PASS, token=MEDIAMTX_API_TOKEN)
 
 # Track last time bytes were received per stream (for last_data_time)
 _stream_bytes_tracker: dict = {}  # {stream_name: {'bytes': int, 'last_change': float}}
@@ -257,7 +259,7 @@ def _fetch_connection_map() -> dict:
     result = {}
     for endpoint in _SOURCE_TYPE_ENDPOINTS.values():
         try:
-            resp = http_requests.get(f'{MEDIAMTX_API_URL}{endpoint}', timeout=3)
+            resp = http_requests.get(f'{MEDIAMTX_API_URL}{endpoint}', timeout=3, **MEDIAMTX_API_AUTH)
             if resp.status_code == 200:
                 for item in resp.json().get('items', []):
                     conn_id = item.get('id', '')
@@ -291,7 +293,7 @@ def _resolve_source_info(source: dict | None, conn_map: dict | None = None) -> d
         endpoint = _SOURCE_TYPE_ENDPOINTS.get(src_type)
         if endpoint and src_id:
             try:
-                resp = http_requests.get(f'{MEDIAMTX_API_URL}{endpoint}', timeout=3)
+                resp = http_requests.get(f'{MEDIAMTX_API_URL}{endpoint}', timeout=3, **MEDIAMTX_API_AUTH)
                 if resp.status_code == 200:
                     for item in resp.json().get('items', []):
                         if item.get('id') == src_id:

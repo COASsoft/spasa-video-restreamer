@@ -15,25 +15,53 @@ logger = logging.getLogger(__name__)
 
 
 class MediaMTXClient:
-    """Client for MediaMTX API interactions"""
-    
-    def __init__(self, api_url: str):
+    """Client for MediaMTX API interactions.
+
+    Optionally authenticates to the MediaMTX control API: pass ``token`` (sent as
+    ``Authorization: Bearer``) or ``user``/``password`` (HTTP Basic). With neither,
+    requests are sent unauthenticated (back-compat with an open localhost API).
+    """
+
+    def __init__(self, api_url: str, *, user: str = None, password: str = None, token: str = None):
         self.api_url = api_url
-    
+        if token:
+            self._auth = None
+            self._headers = {'Authorization': f'Bearer {token}'}
+        elif user:
+            self._auth = (user, password or '')
+            self._headers = {}
+        else:
+            self._auth = None
+            self._headers = {}
+
+    def _req(self, method: str, url: str, **kwargs):
+        """Issue an HTTP request with the configured auth/headers injected.
+
+        Dispatches to the method-specific requests function (requests.get/post/…)
+        so call sites and tests that reference those names keep working.
+        """
+        if self._auth is not None:
+            kwargs.setdefault('auth', self._auth)
+        if self._headers:
+            merged = dict(self._headers)
+            merged.update(kwargs.get('headers') or {})
+            kwargs['headers'] = merged
+        return getattr(requests, method.lower())(url, **kwargs)
+
     def list_paths(self, timeout: int = 5) -> Optional[Dict]:
         """List all active paths from MediaMTX"""
         try:
-            response = requests.get(f'{self.api_url}/v3/paths/list/', timeout=timeout)
+            response = self._req('GET', f'{self.api_url}/v3/paths/list/', timeout=timeout)
             response.raise_for_status()
             return response.json()
         except Exception as e:
             logger.error(f"Error listing paths: {e}")
             return None
-    
+
     def get_path(self, path_name: str, timeout: int = 5) -> Optional[Dict]:
         """Get specific path details. Returns None if path not found (404)."""
         try:
-            response = requests.get(f'{self.api_url}/v3/paths/get/{path_name}', timeout=timeout)
+            response = self._req('GET', f'{self.api_url}/v3/paths/get/{path_name}', timeout=timeout)
             if response.status_code == 404:
                 return None  # Path has no active publisher — not an error
             response.raise_for_status()
@@ -53,7 +81,8 @@ class MediaMTXClient:
         """
         try:
             payload = config or {'source': 'publisher'}
-            response = requests.post(
+            response = self._req(
+                'POST',
                 f'{self.api_url}/v3/config/paths/add/{path_name}',
                 json=payload,
                 timeout=timeout
@@ -66,7 +95,8 @@ class MediaMTXClient:
             logger.debug(
                 f"add_path POST failed for {path_name} ({response.status_code}), trying PATCH"
             )
-            patch_resp = requests.patch(
+            patch_resp = self._req(
+                'PATCH',
                 f'{self.api_url}/v3/config/paths/patch/{path_name}',
                 json=payload,
                 timeout=timeout
@@ -87,7 +117,8 @@ class MediaMTXClient:
     def delete_path(self, path_name: str, timeout: int = 5) -> bool:
         """Delete a path configuration"""
         try:
-            response = requests.delete(
+            response = self._req(
+                'DELETE',
                 f'{self.api_url}/v3/config/paths/delete/{path_name}',
                 timeout=timeout
             )
@@ -109,7 +140,8 @@ class MediaMTXClient:
         conn_type is the endpoint prefix, e.g. 'srtconns', 'rtspsessions'.
         """
         try:
-            response = requests.post(
+            response = self._req(
+                'POST',
                 f'{self.api_url}/v3/{conn_type}/kick/{connection_id}/',
                 timeout=timeout
             )
@@ -127,8 +159,8 @@ class MediaMTXClient:
         all_connections = []
         for endpoint, _label in self._CONN_ENDPOINTS:
             try:
-                response = requests.get(
-                    f'{self.api_url}/v3/{endpoint}/list/', timeout=timeout
+                response = self._req(
+                    'GET', f'{self.api_url}/v3/{endpoint}/list/', timeout=timeout
                 )
                 if response.status_code == 200:
                     data = response.json()

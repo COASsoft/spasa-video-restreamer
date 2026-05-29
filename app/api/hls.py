@@ -22,7 +22,9 @@ from flask import Blueprint, jsonify, request, send_from_directory, abort, Respo
 
 from app.services.abr import abr_manager, HLS_OUTPUT_DIR
 from app.utils.validation import is_valid_stream_name
-from app.config import CORS_ORIGINS
+from app.utils.crypto import hmac_sha256_hex, constant_time_equals
+from app.config import CORS_ORIGINS, SECRET_KEY, HLS_REQUIRE_AUTH, HLS_URL_TTL
+from app.auth import resolve_identity
 
 logger = logging.getLogger(__name__)
 
@@ -54,11 +56,13 @@ def _cors(response):
     return response
 
 
-def _playlist_response(filepath, check_abr_stream=None):
+def _playlist_response(filepath, check_abr_stream=None, sig_suffix=''):
     """Return a playlist as plain 200 OK, bypassing Flask Range handling.
     If check_abr_stream is set, returns 503 when ABR is not running for that stream,
     so HLS.js stops polling instead of hammering forever on a dead stream.
     Also returns 503 when the playlist file itself is stale (FFmpeg alive but hung).
+    When sig_suffix is set, child URIs get the signature query appended so a signed
+    request's downstream fetches (variant playlists / segments) stay authorized.
     """
     # Variant playlists: return 503 when ABR has stopped.
     if check_abr_stream:
@@ -96,6 +100,9 @@ def _playlist_response(filepath, check_abr_stream=None):
     except OSError:
         abort(404)
 
+    if sig_suffix:
+        content = _append_sig_to_playlist(content, sig_suffix)
+
     resp = Response(content, status=200, mimetype='application/vnd.apple.mpegurl')
     resp.headers['Cache-Control'] = 'no-cache, no-store'
     resp.headers['Expires'] = '-1'
@@ -106,6 +113,71 @@ def _valid_stream(name):
     # Strict, centralized validation: rejects '..', leading/trailing separators
     # and path separators (defence-in-depth for the <path:> route converter).
     return is_valid_stream_name(name)
+
+
+# ------------------------------------------------------------------
+# HLS fail-closed access control: authenticated session/API-key/mTLS,
+# OR an HMAC-signed URL (?exp=&sig=) for credential-less cross-origin embeds.
+# ------------------------------------------------------------------
+
+def _sign_stream(stream_name, exp):
+    """HMAC over (stream, expiry). One signature authorizes a stream's whole HLS
+    tree (master + variant playlists + segments all share <stream_name>)."""
+    return hmac_sha256_hex(SECRET_KEY, f'{stream_name}:{exp}')
+
+
+def _valid_signature(stream_name):
+    """True if the request carries a valid, unexpired signature for this stream."""
+    exp = request.args.get('exp', '')
+    sig = request.args.get('sig', '')
+    if not exp or not sig:
+        return False
+    try:
+        if int(exp) < int(time.time()):
+            return False
+    except (TypeError, ValueError):
+        return False
+    return constant_time_equals(sig, _sign_stream(stream_name, exp))
+
+
+def _hls_access_allowed(stream_name):
+    """Fail-closed HLS gate: allowed if auth is disabled, OR the request is an
+    OPTIONS preflight, OR it authenticates (session/API-key/mTLS), OR it carries a
+    valid signature for THIS stream. Default-deny otherwise."""
+    if not HLS_REQUIRE_AUTH:
+        return True
+    if request.method == 'OPTIONS':
+        return True
+    if resolve_identity():
+        return True
+    return _valid_signature(stream_name)
+
+
+def _sig_suffix(stream_name):
+    """Query suffix to propagate to child URLs when the CURRENT request is itself
+    signed (so hls.js, which fetches child URLs verbatim, stays authorized). Empty
+    when the request is cookie/header-authenticated (children then ride the cookie)."""
+    exp = request.args.get('exp')
+    sig = request.args.get('sig')
+    if exp and sig and _valid_signature(stream_name):
+        return f'?exp={exp}&sig={sig}'
+    return ''
+
+
+def _append_sig_to_playlist(content, sig_suffix):
+    """Append the signature query to each child URI in a static ABR playlist
+    (relative ffmpeg-written references don't inherit the parent's query string)."""
+    if not sig_suffix:
+        return content
+    out = []
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith('#'):
+            out.append(line + sig_suffix)  # a segment / child-playlist URI line
+        else:
+            out.append(re.sub(r'URI="([^"]+)"',
+                              lambda m: f'URI="{m.group(1)}{sig_suffix}"', line))
+    return '\n'.join(out) + '\n'
 
 
 # ------------------------------------------------------------------
@@ -140,6 +212,28 @@ def list_abr():
     return jsonify(abr_manager.list_active()), 200
 
 
+@hls_bp.route('/api/streams/<path:stream_name>/hls-token', methods=['GET'])
+def hls_token(stream_name):
+    """Issue a short-lived HMAC-signed HLS URL for this stream.
+
+    Gated by the central RBAC table (GET → viewer+). Lets an authorized caller hand
+    a credential-less, time-limited URL to a cross-origin embed (e.g. the SPASA UI).
+    """
+    if not _valid_stream(stream_name):
+        abort(400)
+    exp = int(time.time()) + HLS_URL_TTL
+    sig = _sign_stream(stream_name, exp)
+    qs = f'?exp={exp}&sig={sig}'
+    return jsonify({
+        'token': sig,
+        'expires': exp,
+        'ttl': HLS_URL_TTL,
+        'player_url': f'/hls/{stream_name}/player{qs}',
+        'master_url': f'/hls/{stream_name}/master.m3u8{qs}',
+        'proxy_url': f'/api/hls/proxy/{stream_name}/index.m3u8{qs}',
+    }), 200
+
+
 # ------------------------------------------------------------------
 # HLS file serving
 # ------------------------------------------------------------------
@@ -149,8 +243,10 @@ def serve_master_playlist(stream_name):
     """Serve the ABR master playlist (raw m3u8, always)."""
     if not _valid_stream(stream_name):
         abort(400)
+    if not _hls_access_allowed(stream_name):
+        return _cors(jsonify({'error': 'forbidden'})), 403
     filepath = os.path.join(HLS_OUTPUT_DIR, stream_name, 'master.m3u8')
-    return _cors(_playlist_response(filepath))
+    return _cors(_playlist_response(filepath, sig_suffix=_sig_suffix(stream_name)))
 
 
 @hls_bp.route('/hls/<path:stream_name>/player')
@@ -158,6 +254,8 @@ def serve_player(stream_name):
     """Embedded hls.js player page for browser viewing."""
     if not _valid_stream(stream_name):
         abort(400)
+    if not _hls_access_allowed(stream_name):
+        return _cors(jsonify({'error': 'forbidden'})), 403
     return _serve_player_page(stream_name)
 
 
@@ -170,12 +268,15 @@ def _serve_player_page(stream_name):
     """
     # Decide which HLS source to use
     abr_status = abr_manager.status(stream_name)
+    # Propagate the signed-URL query (if any) so the player's playlist + segment
+    # fetches stay authorized when the page was opened with a signed URL.
+    sig_suffix = _sig_suffix(stream_name)
     if abr_status.get('running', False):
-        m3u8_url = f'/hls/{stream_name}/master.m3u8'
+        m3u8_url = f'/hls/{stream_name}/master.m3u8{sig_suffix}'
         source_label = 'ABR'
     else:
         # Fall back to MediaMTX native single-bitrate HLS
-        m3u8_url = f'/api/hls/proxy/{stream_name}/index.m3u8'
+        m3u8_url = f'/api/hls/proxy/{stream_name}/index.m3u8{sig_suffix}'
         source_label = 'Native'
 
     # Escape any user-controlled values before interpolation into HTML/JS.
@@ -360,8 +461,11 @@ def serve_variant_playlist(stream_name, variant):
     """Serve a variant (rendition) playlist. Returns 503 when ABR not running."""
     if not _valid_stream(stream_name):
         abort(400)
+    if not _hls_access_allowed(stream_name):
+        return _cors(jsonify({'error': 'forbidden'})), 403
     filepath = os.path.join(HLS_OUTPUT_DIR, stream_name, f'v{variant}', 'index.m3u8')
-    return _cors(_playlist_response(filepath, check_abr_stream=stream_name))
+    return _cors(_playlist_response(filepath, check_abr_stream=stream_name,
+                                    sig_suffix=_sig_suffix(stream_name)))
 
 
 @hls_bp.route('/hls/<path:stream_name>/v<int:variant>/<filename>')
@@ -369,6 +473,8 @@ def serve_segment(stream_name, variant, filename):
     """Serve an HLS segment file (.ts)."""
     if not _valid_stream(stream_name):
         abort(400)
+    if not _hls_access_allowed(stream_name):
+        return _cors(jsonify({'error': 'forbidden'})), 403
     variant_dir = os.path.join(HLS_OUTPUT_DIR, stream_name, f'v{variant}')
     if not os.path.isdir(variant_dir):
         abort(404)
@@ -401,7 +507,12 @@ def proxy_mediamtx_hls(stream_name, filename):
     if request.method == 'OPTIONS':
         return _cors(Response('', status=204))
 
+    # Fail-closed: authenticated session/API-key/mTLS OR a valid signed URL.
+    if not _hls_access_allowed(stream_name):
+        return _cors(jsonify({'error': 'forbidden'})), 403
+
     videoonly = request.args.get('videoonly') == '1'
+    sig_suffix = _sig_suffix(stream_name)
     upstream = f'{MEDIAMTX_HLS_URL}/{stream_name}/{filename}'
     try:
         up = http_requests.get(upstream, stream=True, timeout=30)
@@ -411,7 +522,7 @@ def proxy_mediamtx_hls(stream_name, filename):
         if filename.endswith('.m3u8'):
             ct = 'application/vnd.apple.mpegurl'
             body = up.text
-            rewritten = _rewrite_m3u8(body, stream_name, videoonly=videoonly)
+            rewritten = _rewrite_m3u8(body, stream_name, videoonly=videoonly, sig_suffix=sig_suffix)
             resp = Response(rewritten, content_type=ct)
         else:
             ct = 'video/mp2t' if filename.endswith('.ts') else 'video/mp4'
@@ -426,17 +537,19 @@ def proxy_mediamtx_hls(stream_name, filename):
         return _cors(jsonify({'error': 'MediaMTX HLS timeout'})), 504
 
 
-def _rewrite_m3u8(body, stream_name, videoonly=False):
+def _rewrite_m3u8(body, stream_name, videoonly=False, sig_suffix=''):
     """Rewrite relative/absolute segment and playlist URLs to route through our proxy.
     Handles both plain segment lines and URI= attributes in #EXT-X-MEDIA tags.
     When videoonly=True, strips all audio renditions and cleans the CODECS attribute
     so that browsers with H.265 hardware decode can play back without broken audio tracks.
+    When sig_suffix is set, propagates the signed-URL query onto each child URL so a
+    signed request's downstream fetches stay authorized.
     """
     def _proxy_url(fname):
         fname = fname.lstrip('/')
         if fname.startswith('http'):
             fname = fname.rsplit('/', 1)[-1]
-        return f'/api/hls/proxy/{stream_name}/{fname}'
+        return f'/api/hls/proxy/{stream_name}/{fname}{sig_suffix}'
 
     lines = []
     for line in body.splitlines():
