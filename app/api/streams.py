@@ -17,7 +17,7 @@ import os
 from pathlib import Path
 
 from app.config import (
-    MEDIAMTX_API_URL, DATA_DIR,
+    MEDIAMTX_API_URL, DATA_DIR, FFMPEG_LOG_DIR,
     PULL_STREAM_BUFFER_SIZE, PULL_STREAM_MAX_DELAY
 )
 from app.state import (
@@ -26,6 +26,7 @@ from app.state import (
     recording_lock, pull_stream_lock, hidden_streams, hidden_streams_lock
 )
 from app.services.mediamtx import MediaMTXClient
+from app.services.process import ManagedProcess
 from app.utils.codec_detection import detect_stream_codec, analyze_recording
 from app.utils.thumbnail import generate_thumbnail
 from app.utils.atomic_json import write_json_atomic
@@ -144,20 +145,28 @@ def get_blocked_ips() -> set:
     return _blocked_ips
 
 
+def _spawn_pull_process(stream_name: str, source_url: str) -> ManagedProcess:
+    """Spawn the pull-relay FFmpeg under the process supervisor.
+
+    Uses ManagedProcess so stderr is captured to a log file (no PIPE buffer that
+    could deadlock a long-running relay) and the child runs in its own session
+    for a clean, bounded teardown. Raises RuntimeError if FFmpeg won't start.
+    """
+    ffmpeg_args = _build_pull_ffmpeg_args(source_url, stream_name)
+    proc = ManagedProcess(f'pull-{stream_name}', ffmpeg_args, FFMPEG_LOG_DIR,
+                          label=f'pull:{stream_name}')
+    if not proc.start():
+        raise RuntimeError(f'Failed to start pull FFmpeg for {stream_name}')
+    return proc
+
+
 def _start_pull_impl(stream_name: str, source_url: str, username: str = '', password: str = ''):
     """Core logic to launch a pull stream FFmpeg process and its monitor thread.
     Called both from the API endpoint and from the startup restore path.
     Raises on error.
     """
-    ffmpeg_args = _build_pull_ffmpeg_args(source_url, stream_name)
     logger.info(f"Starting pull stream: {stream_name} from {source_url}")
-
-    process = subprocess.Popen(
-        ffmpeg_args,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE
-    )
+    process = _spawn_pull_process(stream_name, source_url)
 
     with pull_stream_lock:
         active_pull_streams[stream_name] = process
@@ -497,8 +506,10 @@ def _finalize_recording_for_reconnect(stream_name: str):
         recording_info = active_recordings[stream_name]
         recording_process = recording_info.get('process')
         if recording_process and recording_process.poll() is None:
-            recording_process.stdin.write(b'q')
-            recording_process.stdin.flush()
+            # recording_process is a ManagedProcess: ask FFmpeg to quit cleanly
+            # (writes the MOV moov atom) via its stdin 'q', falling back to SIGTERM.
+            if not recording_process.request_graceful_quit():
+                recording_process.terminate()
             try:
                 recording_process.wait(timeout=10)
             except subprocess.TimeoutExpired:
@@ -527,15 +538,16 @@ def _pull_stream_loop(stream_name: str):
         if not process:
             break
 
-        # Drain stderr and wait for exit
-        stderr_output = []
-        for line in process.stderr:
-            stderr_output.append(line.decode('utf-8', errors='ignore'))
+        # Wait for exit; stderr is captured to a log file by ManagedProcess
+        # (no PIPE to drain), so there is no deadlock risk on long relays.
         return_code = process.wait()
+        stderr_tail = process.tail_stderr(20)
+        process.close()
 
         if return_code != 0:
             logger.error(f"Pull stream FFmpeg exited with code {return_code} for {stream_name}")
-            logger.error(f"FFmpeg stderr: {''.join(stderr_output[-20:])}")
+            if stderr_tail:
+                logger.error(f"FFmpeg stderr: {' / '.join(stderr_tail)}")
 
         # Clean up process reference
         with pull_stream_lock:
@@ -605,13 +617,7 @@ def _pull_stream_loop(stream_name: str):
         # Start a new FFmpeg process
         try:
             source_url = config['source_url']
-            ffmpeg_args = _build_pull_ffmpeg_args(source_url, stream_name)
-            new_process = subprocess.Popen(
-                ffmpeg_args,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-            )
+            new_process = _spawn_pull_process(stream_name, source_url)
             with pull_stream_lock:
                 active_pull_streams[stream_name] = new_process
             broadcast('pull_stream_reconnected', {

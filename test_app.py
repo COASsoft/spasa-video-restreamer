@@ -416,7 +416,23 @@ class TestThumbnailGeneration:
 
 class TestPatternGenerator:
     """Test suite for test pattern generator endpoints"""
-    
+
+    @pytest.fixture(autouse=True)
+    def _no_real_ffmpeg(self):
+        """Don't spawn a real FFmpeg for test patterns: it would try to publish
+        to localhost:8554 and pollute a running rig's paths. Patch the supervisor
+        so these tests exercise the endpoints, not the process layer."""
+        with patch('app.api.test.ManagedProcess') as MockMP:
+            inst = MockMP.return_value
+            inst.start.return_value = True
+            inst.pid = 4321
+            inst.poll.return_value = None
+            inst.is_alive.return_value = True
+            inst.tail_stderr.return_value = []
+            inst.request_graceful_quit.return_value = True
+            inst.wait.return_value = 0
+            yield
+
     def test_start_srt_test_pattern_endpoint_exists(self, client):
         """Test that SRT test pattern endpoint is accessible"""
         response = client.post('/api/test/srt',
@@ -566,6 +582,13 @@ class TestRecordingLifecycle:
     graceful-quit + race-safe cleanup fixes that unify auto/manual recording.
     """
 
+    @pytest.fixture(autouse=True)
+    def _plenty_of_disk(self):
+        """Decouple these tests from the host's actual free space so the
+        disk-full pre-flight guard never aborts them."""
+        with patch('app.api.recordings._streams_free_gb', return_value=9999.0):
+            yield
+
     def test_begin_and_stop_recording(self, client, tmp_path):
         from app.api import recordings as rec
         out = str(tmp_path / 'rec.mov')
@@ -594,6 +617,73 @@ class TestRecordingLifecycle:
         resp = client.post('/api/streams/does-not-exist/stop-record', json={})
         assert resp.status_code == 200
         assert 'already stopped' in resp.get_data(as_text=True).lower()
+
+    def test_auto_record_subdir_is_listed(self, client):
+        """A recording written into STREAMS_DIR/<stream>/ (as auto-record now
+        does, instead of the STREAMS_DIR root) is discoverable via
+        list_recordings, which only scans per-stream subdirs."""
+        from app.api import recordings as rec
+        from app.config import STREAMS_DIR
+        stream = 'autosubdir'
+        stream_dir = os.path.join(STREAMS_DIR, stream)
+        os.makedirs(stream_dir, exist_ok=True)
+        out = os.path.join(stream_dir, 'recording-2026-01-01T00-00-00-000Z.mov')
+        # Fake ffmpeg: create the output file and exit immediately.
+        cmd = [sys.executable, '-c', 'import sys; open(sys.argv[1], "w").write("x")', out]
+        with patch('app.api.recordings.broadcast'), \
+             patch('app.api.recordings.generate_thumbnail'):
+            proc = rec.begin_recording(stream, cmd, out, codec='h264', auto_started=True)
+            assert proc is not None
+            proc.wait(timeout=5)
+
+        resp = client.get('/api/recordings')
+        assert resp.status_code == 200
+        items = json.loads(resp.data)
+        assert any(r['stream'] == stream and r['filename'].endswith('.mov')
+                   for r in items)
+
+
+class TestPullStreamSupervised:
+    """Pull relay now spawns under ManagedProcess (stderr->file, own session,
+    no PIPE deadlock) instead of a raw Popen (A1)."""
+
+    def test_spawn_pull_process_uses_managed_process(self):
+        from app.api import streams
+        with patch('app.api.streams.ManagedProcess') as MockMP:
+            inst = MockMP.return_value
+            inst.start.return_value = True
+            inst.pid = 555
+            proc = streams._spawn_pull_process('pullx', 'rtsp://127.0.0.1:8554/src')
+        assert proc is inst
+        args, _ = MockMP.call_args
+        assert args[0] == 'pull-pullx'   # named for the registry/log file
+        inst.start.assert_called_once()
+
+    def test_spawn_pull_process_raises_when_ffmpeg_fails(self):
+        from app.api import streams
+        with patch('app.api.streams.ManagedProcess') as MockMP:
+            MockMP.return_value.start.return_value = False
+            with pytest.raises(RuntimeError):
+                streams._spawn_pull_process('pully', 'rtsp://127.0.0.1:8554/src')
+
+
+class TestRecordingDiskGuard:
+    """Disk-full / ENOSPC guard on the recording path (A4), hermetic."""
+
+    def test_streams_free_gb_handles_error(self):
+        from app.api import recordings as rec
+        with patch('app.api.recordings.shutil.disk_usage', side_effect=OSError):
+            assert rec._streams_free_gb() == -1.0
+
+    def test_begin_recording_aborts_on_low_disk(self, client):
+        from app.api import recordings as rec
+        with patch('app.api.recordings._streams_free_gb', return_value=0.5), \
+             patch('app.api.recordings.broadcast') as mock_bcast:
+            proc = rec.begin_recording('lowdisk', ['ffmpeg'], '/tmp/x.mov', codec='h264')
+        assert proc is None
+        assert 'lowdisk' not in rec.active_recordings
+        # A disk-full event was broadcast and no FFmpeg was spawned.
+        assert any('disk_full' in str(c.args[0]) for c in mock_bcast.call_args_list)
 
 
 # =============================================================================

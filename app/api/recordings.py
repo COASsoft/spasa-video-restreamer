@@ -19,7 +19,7 @@ import re
 from pathlib import Path
 import logging
 
-from app.config import STREAMS_DIR, SHARED_VIDEOS_DIR
+from app.config import STREAMS_DIR, SHARED_VIDEOS_DIR, FFMPEG_LOG_DIR
 from app.state import active_recordings, thumbnail_executor, post_processing_queue, recording_lock
 from app.api.settings import server_settings
 from app.utils.codec_detection import detect_stream_codec, analyze_recording
@@ -32,9 +32,13 @@ logger = logging.getLogger(__name__)
 
 recordings_bp = Blueprint('recordings', __name__)
 
-# FFmpeg stderr for recordings is captured here (shared with other services).
-_FFMPEG_LOG_DIR = os.environ.get(
-    'FFMPEG_LOG_DIR', os.path.join(os.environ.get('LOGS_DIR', '/opt/app/logs'), 'ffmpeg'))
+
+def _streams_free_gb() -> float:
+    """Free space (GB) on the recordings volume; -1.0 if it can't be determined."""
+    try:
+        return shutil.disk_usage(STREAMS_DIR).free / (1024 ** 3)
+    except OSError:
+        return -1.0
 
 
 def begin_recording(stream_name, ffmpeg_args, recording_file, *, codec,
@@ -53,7 +57,18 @@ def begin_recording(stream_name, ffmpeg_args, recording_file, *, codec,
     if start_dt is None:
         start_dt = datetime.now(timezone.utc)
 
-    proc = ManagedProcess(f'rec-{stream_name}', ffmpeg_args, _FFMPEG_LOG_DIR,
+    # Fail closed on a (near-)full disk: don't start a recording we can't write.
+    min_free_gb = server_settings.get('min_free_space_gb', 10)
+    free_gb = _streams_free_gb()
+    if free_gb >= 0 and free_gb < min_free_gb:
+        logger.error(f"Refusing to start recording for {stream_name}: only "
+                     f"{free_gb:.1f}GB free (< {min_free_gb}GB minimum)")
+        broadcast('recording_disk_full',
+                  {'name': stream_name, 'free_gb': round(free_gb, 2),
+                   'min_free_gb': min_free_gb})
+        return None
+
+    proc = ManagedProcess(f'rec-{stream_name}', ffmpeg_args, FFMPEG_LOG_DIR,
                           label=f'rec:{stream_name}', stdin_pipe=True)
     if not proc.start():
         return None
@@ -87,6 +102,9 @@ def begin_recording(stream_name, ffmpeg_args, recording_file, *, codec,
             cur = active_recordings.get(stream_name)
             if cur is not None and cur.get('process') is proc:
                 del active_recordings[stream_name]
+        # Release the stderr log FD now that the process is gone (stop() was not
+        # necessarily called on a natural exit).
+        proc.close()
 
     threading.Thread(target=_monitor_exit, daemon=True, name=f'rec-mon-{stream_name}').start()
 
@@ -98,6 +116,18 @@ def begin_recording(stream_name, ffmpeg_args, recording_file, *, codec,
         while proc.poll() is None:
             time.sleep(10)
             try:
+                # Stop early if the disk is running out, before a write fails.
+                min_free_gb = server_settings.get('min_free_space_gb', 10)
+                free_gb = _streams_free_gb()
+                if free_gb >= 0 and free_gb < min_free_gb:
+                    logger.warning(f"Recording {stream_name} stopping: only "
+                                   f"{free_gb:.1f}GB free (< {min_free_gb}GB minimum)")
+                    if not proc.request_graceful_quit():
+                        proc.terminate()
+                    broadcast('recording_low_space',
+                              {'name': stream_name, 'free_gb': round(free_gb, 2),
+                               'min_free_gb': min_free_gb})
+                    break
                 if server_settings.get('segmented_recording', False):
                     total = sum(f.stat().st_size for f in Path(stream_dir).glob('recording-*.mov'))
                 else:

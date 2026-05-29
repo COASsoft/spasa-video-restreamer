@@ -26,16 +26,13 @@ import time
 from typing import Dict, Optional
 import requests
 
-from app.config import MEDIAMTX_API_URL, DATA_DIR
+from app.config import MEDIAMTX_API_URL, DATA_DIR, FFMPEG_LOG_DIR
 from app.utils.atomic_json import write_json_atomic, read_json
 
 logger = logging.getLogger(__name__)
 
 # Directory where HLS segments and playlists are written
 HLS_OUTPUT_DIR = os.environ.get('HLS_OUTPUT_DIR', '/opt/app/hls')
-
-# Directory for FFmpeg stderr logs
-FFMPEG_LOG_DIR = os.environ.get('FFMPEG_LOG_DIR', os.path.join(os.environ.get('LOGS_DIR', '/opt/app/logs'), 'ffmpeg'))
 
 # MediaMTX RTSP endpoint for FFmpeg to read from.
 # Use 127.0.0.1 (not 'localhost') to avoid IPv6 resolution issues on Windows

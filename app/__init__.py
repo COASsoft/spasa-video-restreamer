@@ -122,7 +122,10 @@ def create_app():
         if login_view:
             app.limiter.limit("5 per minute")(login_view)
 
-    # Protect ALL API routes except public ones (health, auth login/status, HLS segments)
+    # Protect ALL API routes except public ones (health, auth login/status, HLS segments).
+    # NOTE: /metrics is intentionally outside this gate (root path, for Prometheus
+    # scraping); it has its own optional bearer guard (METRICS_TOKEN) and should be
+    # restricted at the nginx edge in production.
     _PUBLIC_PREFIXES = ('/api/health', '/api/auth/login', '/api/auth/status',
                         '/login', '/static/', '/hls/', '/api/hls/proxy/')
     from flask_login import current_user as _cu

@@ -311,6 +311,31 @@ class TestManagedProcess:
         assert mp.request_graceful_quit() is False  # no stdin pipe configured
         mp.stop(term_timeout=3)
 
+    def test_close_releases_log_fd_idempotently(self, tmp_path):
+        mp = ManagedProcess('c', _EXIT_NOW, str(tmp_path))
+        assert mp.start() is True
+        mp.wait(timeout=5)
+        mp.close()
+        mp.close()  # idempotent — must not raise
+        assert isinstance(mp.tail_stderr(), list)
+
+    def test_registry_hooks_fire_on_spawn_and_exit(self, tmp_path):
+        from app.services import process as proc_mod
+        spawned, exited = [], []
+        proc_mod.set_registry_hooks(
+            on_spawn=lambda pid, label, cmd: spawned.append(pid),
+            on_exit=lambda pid: exited.append(pid))
+        try:
+            mp = ManagedProcess('h', _EXIT_NOW, str(tmp_path))
+            assert mp.start() is True
+            pid = mp.pid
+            mp.wait(timeout=5)
+            mp.close()
+            assert spawned == [pid]
+            assert exited == [pid]
+        finally:
+            proc_mod.set_registry_hooks(None, None)  # don't leak into other tests
+
 
 class TestSupervise:
     def test_restarts_until_stop(self, tmp_path):
@@ -364,6 +389,79 @@ class TestSupervise:
         # should_stop True from the start -> loop returns without spawning.
         supervise(lambda: make(), lambda: stop_flag['v'], check_interval=0.05)
         # Nothing to assert beyond "it returned"; reaching here means no hang.
+
+
+class TestMetricsCache:
+    """The /metrics MediaMTX probe is cached so a high scrape rate doesn't issue
+    one (2s-blocking) network call per scrape (F4)."""
+
+    def test_mediamtx_probe_is_cached(self, monkeypatch):
+        from app.api import metrics
+        metrics._mediamtx_up_cache['ts'] = 0.0  # force a cold cache
+        calls = {'n': 0}
+
+        class _Resp:
+            status_code = 200
+
+        def fake_get(*a, **k):
+            calls['n'] += 1
+            return _Resp()
+
+        monkeypatch.setattr(metrics.http_requests, 'get', fake_get)
+        assert metrics._mediamtx_up() == 1
+        assert metrics._mediamtx_up() == 1  # served from cache
+        assert calls['n'] == 1
+
+
+class TestReconcile:
+    """Startup reconciliation of orphaned FFmpeg via the PID registry (A3)."""
+
+    def test_register_unregister_roundtrip(self, tmp_path, monkeypatch):
+        from app.services import reconcile
+        monkeypatch.setattr(reconcile, '_REGISTRY_FILE', str(tmp_path / 'reg.json'))
+        reconcile.register(111, 'rec:a', ['ffmpeg', '-i', 'x', 'out.mov'])
+        reconcile.register(222, 'pull:b', ['ffmpeg', 'rtsp://localhost:8554/b'])
+        assert set(reconcile._load().keys()) == {'111', '222'}
+        reconcile.unregister(111)
+        assert set(reconcile._load().keys()) == {'222'}
+
+    def test_kills_alive_ffmpeg_orphan_only(self, tmp_path, monkeypatch):
+        from app.services import reconcile
+        monkeypatch.setattr(reconcile, '_REGISTRY_FILE', str(tmp_path / 'reg.json'))
+        registry = {
+            '101': {'label': 'rec:a', 'cmd': 'ffmpeg -i rtsp://x /data/a/recording-1.mov'},
+            '102': {'label': 'pull:b', 'cmd': 'ffmpeg -i rtsp://y rtsp://localhost:8554/b'},
+            '103': {'label': 'rec:c', 'cmd': 'ffmpeg -i rtsp://z /data/c/recording-2.mov'},
+        }
+        killed = []
+        # 101 alive + still ffmpeg + matches -> killed.
+        # 102 dead -> skipped. 103 alive but PID reused by non-ffmpeg -> skipped.
+        reaped = reconcile.reconcile_orphans(
+            registry=registry,
+            _is_alive=lambda pid: pid in (101, 103),
+            _cmdline=lambda pid: {
+                101: 'ffmpeg -i rtsp://x /data/a/recording-1.mov',
+                103: 'python unrelated-process',
+            }.get(pid, ''),
+            _kill=killed.append)
+        assert reaped == [101]
+        assert killed == [101]
+        assert reconcile._load() == {}  # registry reset for the fresh instance
+
+    def test_pid_reuse_guard_does_not_kill_mismatched_cmdline(self, tmp_path, monkeypatch):
+        from app.services import reconcile
+        monkeypatch.setattr(reconcile, '_REGISTRY_FILE', str(tmp_path / 'reg.json'))
+        registry = {'200': {'label': 'rec:a', 'cmd': 'ffmpeg -i x /data/a/recording-9.mov'}}
+
+        def _must_not_kill(pid):
+            raise AssertionError('reused PID must not be killed')
+
+        reaped = reconcile.reconcile_orphans(
+            registry=registry,
+            _is_alive=lambda pid: True,
+            _cmdline=lambda pid: 'ffmpeg -i other /data/z/recording-other.mov',
+            _kill=_must_not_kill)
+        assert reaped == []
 
 
 class TestServerSettingsPersistence:

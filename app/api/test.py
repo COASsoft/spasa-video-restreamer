@@ -14,16 +14,13 @@ import time
 import uuid
 from flask import Blueprint, request, jsonify
 
+from app.config import FFMPEG_LOG_DIR
 from app.utils.validation import is_valid_stream_name
 from app.services.process import ManagedProcess
 
 logger = logging.getLogger(__name__)
 
 test_bp = Blueprint('test', __name__, url_prefix='/api/test')
-
-# Where FFmpeg stderr for test patterns is captured (shared with other services).
-_FFMPEG_LOG_DIR = os.environ.get(
-    'FFMPEG_LOG_DIR', os.path.join(os.environ.get('LOGS_DIR', '/opt/app/logs'), 'ffmpeg'))
 
 # Store active test processes
 active_tests = {}
@@ -128,7 +125,7 @@ def _start_test(protocol: str):
     logger.info(f"Starting {label} test pattern: {stream_name} ({resolution} {framerate}fps {pattern}) "
                 f"{'continuous' if duration == 0 else f'{duration}s'}")
 
-    process = ManagedProcess(f'test-{stream_name}', cmd, _FFMPEG_LOG_DIR,
+    process = ManagedProcess(f'test-{stream_name}', cmd, FFMPEG_LOG_DIR,
                              label=f'test:{protocol}:{stream_name}')
     if not process.start():
         return jsonify({'success': False, 'error': 'Failed to start FFmpeg'}), 500

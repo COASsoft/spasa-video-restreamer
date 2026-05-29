@@ -67,6 +67,9 @@ STREAMS_DIR = os.environ.get('STREAMS_DIR', '/opt/app/streams')
 # Places a copy of recordings in a shared volume.
 SHARED_VIDEOS_DIR = os.environ.get('SHARED_VIDEOS_DIR', '/opt/app/shared_videos')
 LOGS_DIR = os.environ.get('LOGS_DIR', '/opt/app/logs')
+# Per-process FFmpeg stderr logs (shared by recordings/test/abr/srt). Centralized
+# here so every spawn site captures stderr to the same place.
+FFMPEG_LOG_DIR = os.environ.get('FFMPEG_LOG_DIR', os.path.join(LOGS_DIR, 'ffmpeg'))
 DATA_DIR = os.environ.get('DATA_DIR', '/opt/app/data')
 CERTS_DIR = os.environ.get('CERTS_DIR', os.path.join(STREAMS_DIR, '.certs'))
 EXTERNAL_CERTS_DIR = os.environ.get('EXTERNAL_CERTS_DIR', '/opt/app/external-certs')
@@ -120,6 +123,12 @@ MEDIAMTX_RTSP_URL = os.environ.get('MEDIAMTX_RTSP_URL', 'rtsp://127.0.0.1:8554')
 
 # CORS Configuration
 CORS_ORIGINS = os.environ.get('CORS_ORIGINS', '*')
+
+# Optional bearer token gating the /metrics endpoint. /metrics sits OUTSIDE the
+# /api auth gate (Prometheus-style root path), so when this is unset it is
+# reachable without auth — acceptable for the VPN-only deployment. Set it (or
+# restrict /metrics at the nginx edge) to lock the endpoint down.
+METRICS_TOKEN = os.environ.get('METRICS_TOKEN', '')
 
 # Logging Configuration
 LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()

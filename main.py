@@ -137,9 +137,18 @@ def monitor_streams_for_auto_record():
                                     stream_info = detect_stream_codec(rtsp_url)
                                     if stream_info:
                                         now = datetime.now(timezone.utc)
-                                        timestamp = now.strftime('%Y%m%d_%H%M%S')
-                                        filename = f"{stream_name}_{timestamp}.mov"
-                                        output_path = os.path.join(STREAMS_DIR, filename)
+                                        # Write into the per-stream subdir using the
+                                        # SAME naming as manual recordings so that
+                                        # list_recordings (which only scans subdirs),
+                                        # the segmented glob (recording-*.mov) and
+                                        # thumbnails all treat auto-records identically.
+                                        # Previously this wrote to the STREAMS_DIR root,
+                                        # so auto-records were never listed.
+                                        stream_dir = os.path.join(STREAMS_DIR, stream_name)
+                                        os.makedirs(stream_dir, exist_ok=True)
+                                        timestamp = now.strftime('%Y-%m-%dT%H-%M-%S-%f')[:-3] + 'Z'
+                                        filename = f"recording-{timestamp}.mov"
+                                        output_path = os.path.join(stream_dir, filename)
 
                                         has_audio = stream_info.get('has_audio', False)
                                         has_data = stream_info.get('has_data', False)
@@ -221,6 +230,15 @@ def monitor_streams_for_auto_record():
         # Check every 2 seconds
         time.sleep(2)
 
+
+# Wire process registration and reap any FFmpeg orphaned by a previously crashed
+# instance BEFORE create_app() (whose ABR restore may itself spawn processes).
+from app.services.reconcile import install_hooks as _install_proc_hooks, reconcile_orphans as _reconcile_orphans
+_install_proc_hooks()
+try:
+    _reconcile_orphans()
+except Exception as e:
+    logger.error(f"Startup reconciliation failed: {e}")
 
 # Create Flask app at module level for Gunicorn
 app = create_app()

@@ -32,6 +32,22 @@ import time
 logger = logging.getLogger(__name__)
 
 
+# Optional registry hooks, set by app.services.reconcile.install_hooks(). Kept as
+# plain module-level callables so this module stays free of app/config imports
+# (and trivially unit-testable). Signatures:
+#   _spawn_hook(pid: int, label: str, cmd: list)  -- after a successful spawn
+#   _exit_hook(pid: int)                          -- when the process is torn down
+_spawn_hook = None
+_exit_hook = None
+
+
+def set_registry_hooks(on_spawn=None, on_exit=None):
+    """Install (or clear) the spawn/exit hooks used for orphan reconciliation."""
+    global _spawn_hook, _exit_hook
+    _spawn_hook = on_spawn
+    _exit_hook = on_exit
+
+
 def open_stderr_log(log_dir: str, name: str):
     """Open a per-process stderr log file. Returns (file_or_DEVNULL, path_or_None)."""
     try:
@@ -95,6 +111,11 @@ class ManagedProcess:
             return False
         self.started_at = time.monotonic()
         logger.info("ManagedProcess %s started (pid=%s)", self.label, self._proc.pid)
+        if _spawn_hook is not None:
+            try:
+                _spawn_hook(self._proc.pid, self.label, self.cmd)
+            except Exception as e:  # registry must never break a spawn
+                logger.debug("spawn hook error for %s: %s", self.label, e)
         return True
 
     @property
@@ -180,6 +201,14 @@ class ManagedProcess:
     def stderr_path(self):
         return self._stderr_path
 
+    def close(self):
+        """Release the captured stderr file handle (idempotent).
+
+        Use this when the process exited on its own (i.e. ``stop()`` was not
+        called) so the log FD isn't held open until garbage collection.
+        """
+        self._close_log()
+
     def _close_log(self):
         f = self._stderr_file
         if f is not None and f is not subprocess.DEVNULL and hasattr(f, 'close'):
@@ -188,6 +217,13 @@ class ManagedProcess:
             except OSError:
                 pass
         self._stderr_file = None
+        # Drop the registry entry once we stop tracking the process. Guarded by
+        # pid (None on a failed/never-started spawn → nothing was registered).
+        if _exit_hook is not None and self._proc is not None:
+            try:
+                _exit_hook(self._proc.pid)
+            except Exception as e:
+                logger.debug("exit hook error for %s: %s", self.label, e)
 
 
 def _sleep_unless_stop(should_stop, seconds: float, slice_s: float = 0.25) -> bool:
