@@ -189,6 +189,25 @@ API_KEY_DEFAULT_ROLE = os.environ.get('API_KEY_DEFAULT_ROLE', 'viewer')
 HLS_REQUIRE_AUTH = _env_bool('HLS_REQUIRE_AUTH', True)
 # TTL (seconds) for signed HLS URLs issued by /api/streams/<name>/hls-token.
 HLS_URL_TTL = _env_int('HLS_URL_TTL', 3600, minimum=60, maximum=86400)
+# When True, HLS *segments* are served by nginx via X-Accel-Redirect (the app still
+# makes the fail-closed authz decision, but the bytes never pass through Python).
+# Requires the nginx /_hls_internal/ location + a read-only HLS mount in the proxy.
+# Default OFF so direct runs (dev/rig/tests, no nginx) serve segments from disk.
+HLS_X_ACCEL = _env_bool('HLS_X_ACCEL', False)
+# Internal location prefix nginx maps back to the HLS dir (see nginx template).
+HLS_X_ACCEL_PREFIX = os.environ.get('HLS_X_ACCEL_PREFIX', '/_hls_internal')
+
+# ---------------------------------------------------------------------------
+# Observability (Fase 4)
+# ---------------------------------------------------------------------------
+# Emit logs as structured JSON (one object per line) with a correlation id.
+# Default OFF (human-readable in dev); the container turns it on.
+LOG_JSON = _env_bool('LOG_JSON', False)
+# Optional syslog/SIEM sink for the tamper-evident audit trail. When AUDIT_SYSLOG_HOST
+# is set, each audit record is also shipped to syslog (append-only off-box = the real
+# anti-tamper control). Unset = local file only (back-compat).
+AUDIT_SYSLOG_HOST = os.environ.get('AUDIT_SYSLOG_HOST', '')
+AUDIT_SYSLOG_PORT = _env_int('AUDIT_SYSLOG_PORT', 514, minimum=1, maximum=65535)
 
 # Logging Configuration
 LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()

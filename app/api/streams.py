@@ -1109,6 +1109,81 @@ def get_recording_status():
     return jsonify(status)
 
 
+def _proc_health(proc):
+    """Summarise a ManagedProcess for health reporting (None-safe)."""
+    if proc is None:
+        return {'active': False}
+    try:
+        alive = proc.is_alive()
+        return {
+            'active': alive,
+            'pid': proc.pid,
+            'uptime_seconds': round(proc.uptime(), 1),
+            'returncode': proc.returncode,
+            'recent_stderr': proc.tail_stderr(5) if not alive else [],
+        }
+    except Exception as e:
+        return {'active': False, 'error': str(e)}
+
+
+def _collect_stream_health(stream_name):
+    """Aggregate per-stream health across recording, pull and ABR processes.
+
+    Reuses ManagedProcess (is_alive/pid/uptime/returncode/tail_stderr) and
+    abr_manager.status(). Overall status: down if an expected process died with a
+    non-zero exit; degraded if it restarted/retried; healthy if running; inactive
+    if nothing is running for this stream."""
+    from app.services.abr import abr_manager  # lazy: avoid import-order coupling
+
+    with recording_lock:
+        rec_entry = active_recordings.get(stream_name)
+        recording = _proc_health(rec_entry.get('process') if rec_entry else None)
+    with pull_stream_lock:
+        pull_proc = active_pull_streams.get(stream_name)
+        pull_cfg = pull_stream_configs.get(stream_name) or {}
+        pull = _proc_health(pull_proc)
+        pull['retry_count'] = pull_cfg.get('retry_count', 0)
+    abr = abr_manager.status(stream_name)
+
+    # Derive an overall status.
+    components = [recording, pull]
+    any_active = any(c.get('active') for c in components) or abr.get('running')
+    died = any(c.get('returncode') not in (None, 0) for c in components)
+    degraded = (pull.get('retry_count', 0) > 0) or (abr.get('restart_count', 0) > 0)
+    if died:
+        status = 'down'
+    elif any_active:
+        status = 'degraded' if degraded else 'healthy'
+    else:
+        status = 'inactive'
+
+    return {
+        'stream': stream_name,
+        'status': status,
+        'recording': recording,
+        'pull': pull,
+        'abr': {
+            'active': bool(abr.get('running')),
+            'pid': abr.get('pid'),
+            'uptime_seconds': abr.get('uptime_seconds', 0),
+            'restart_count': abr.get('restart_count', 0),
+        },
+        'timestamp': datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@streams_bp.route('/api/streams/<path:stream_name>/health', methods=['GET'])
+def get_stream_health(stream_name):
+    """Per-stream health derived from the supervised FFmpeg processes (viewer+)."""
+    if not is_valid_stream_name(stream_name):
+        return jsonify({'error': 'Invalid stream name'}), 400
+    try:
+        return jsonify(_collect_stream_health(stream_name)), 200
+    except Exception as e:
+        logger.error(f"Error collecting health for {stream_name}: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
 @streams_bp.route('/api/post-processing/status', methods=['GET'])
 def get_post_processing_status():
     """Get status of post-processing queue"""

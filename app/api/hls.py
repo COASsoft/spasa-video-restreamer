@@ -23,7 +23,8 @@ from flask import Blueprint, jsonify, request, send_from_directory, abort, Respo
 from app.services.abr import abr_manager, HLS_OUTPUT_DIR
 from app.utils.validation import is_valid_stream_name
 from app.utils.crypto import hmac_sha256_hex, constant_time_equals
-from app.config import CORS_ORIGINS, SECRET_KEY, HLS_REQUIRE_AUTH, HLS_URL_TTL
+from app.config import (CORS_ORIGINS, SECRET_KEY, HLS_REQUIRE_AUTH, HLS_URL_TTL,
+                        HLS_X_ACCEL, HLS_X_ACCEL_PREFIX)
 from app.auth import resolve_identity
 
 logger = logging.getLogger(__name__)
@@ -479,6 +480,17 @@ def serve_segment(stream_name, variant, filename):
     if not os.path.isdir(variant_dir):
         abort(404)
     mimetype = 'video/mp2t' if filename.endswith('.ts') else 'application/octet-stream'
+    # Data-plane offload: once the (fail-closed) access decision is made, hand the
+    # heavy segment bytes to nginx via X-Accel-Redirect so they never pass through
+    # the Python worker. The direct-serve fallback keeps dev/rig/tests (no nginx) working.
+    if HLS_X_ACCEL:
+        if not os.path.isfile(os.path.join(variant_dir, filename)):
+            abort(404)
+        internal = f'{HLS_X_ACCEL_PREFIX}/{stream_name}/v{variant}/{filename}'
+        resp = Response('', status=200, mimetype=mimetype)
+        resp.headers['X-Accel-Redirect'] = internal
+        resp.headers['Cache-Control'] = 'public, max-age=60'
+        return _cors(resp)
     resp = send_from_directory(variant_dir, filename, mimetype=mimetype)
     resp.headers['Cache-Control'] = 'public, max-age=60'
     return _cors(resp)

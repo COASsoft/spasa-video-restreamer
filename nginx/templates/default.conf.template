@@ -67,6 +67,8 @@ server {
     proxy_set_header X-Forwarded-For     $proxy_add_x_forwarded_for;
     proxy_set_header X-Real-IP           $remote_addr;
     proxy_set_header Host                $host;
+    # Cross-tier correlation: forward (or originate) a request id the app echoes in logs.
+    proxy_set_header X-Request-ID        $request_id;
 
     # Generous cap for recording uploads / cert uploads (matches Flask MAX_CONTENT_LENGTH).
     client_max_body_size 512m;
@@ -100,8 +102,20 @@ server {
         proxy_pass http://media_app;
     }
 
-    # --- Forward-looking (Phase 3 data-plane): serve /hls/ and recording downloads
-    # directly from nginx via X-Accel-Redirect to offload the app. Left as a hook;
-    # HLS is currently served (fail-closed) by Flask.
-    # location /internal-hls/ { internal; alias /opt/app/hls/; }
+    # --- HLS data-plane offload (X-Accel-Redirect) ---
+    # The app makes the fail-closed authz decision on /hls/<s>/v<N>/<seg> and, when
+    # HLS_X_ACCEL=true, returns X-Accel-Redirect: /_hls_internal/...; nginx then serves
+    # the segment from disk directly (bytes never traverse the Python worker). This
+    # location is `internal` so it cannot be requested by clients. Requires the proxy
+    # to mount the HLS dir read-only at /opt/app/hls (see docker-compose.yml).
+    location /_hls_internal/ {
+        internal;
+        alias /opt/app/hls/;
+        types {
+            video/mp2t                  ts;
+            video/iso.segment           m4s;
+            application/vnd.apple.mpegurl m3u8;
+        }
+        add_header Cache-Control "public, max-age=60";
+    }
 }

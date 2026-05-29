@@ -1081,6 +1081,101 @@ class TestMediaMTXClientAuth:
 
 
 # =============================================================================
+# HLS data-plane offload (X-Accel-Redirect)
+# =============================================================================
+
+class TestHLSXAccel:
+    """When HLS_X_ACCEL is on, segments are handed to nginx (X-Accel-Redirect)
+    AFTER the fail-closed access decision; off, they're served from disk."""
+
+    def _write_segment(self, name='xaccel', variant=0):
+        from app.services.abr import HLS_OUTPUT_DIR
+        d = os.path.join(HLS_OUTPUT_DIR, name, f'v{variant}')
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, 'seg0.ts'), 'wb') as f:
+            f.write(b'TSDATA' * 50)
+        return name
+
+    def test_xaccel_on_returns_redirect_header(self, client, monkeypatch):
+        monkeypatch.setattr('app.api.hls.HLS_X_ACCEL', True)
+        name = self._write_segment('xaccelon')
+        r = client.get(f'/hls/{name}/v0/seg0.ts')
+        assert r.status_code == 200
+        assert r.headers.get('X-Accel-Redirect') == f'/_hls_internal/{name}/v0/seg0.ts'
+        assert r.data == b''  # body offloaded to nginx
+
+    def test_xaccel_off_serves_bytes(self, client, monkeypatch):
+        monkeypatch.setattr('app.api.hls.HLS_X_ACCEL', False)
+        name = self._write_segment('xacceloff')
+        r = client.get(f'/hls/{name}/v0/seg0.ts')
+        assert r.status_code == 200
+        assert 'X-Accel-Redirect' not in r.headers
+        assert r.data == b'TSDATA' * 50
+
+    def test_xaccel_still_fail_closed(self, anon_client, monkeypatch):
+        # Offload must not bypass auth: anon still 403 even with X-Accel on.
+        monkeypatch.setattr('app.api.hls.HLS_X_ACCEL', True)
+        self._write_segment('xaccelsec')
+        assert anon_client.get('/hls/xaccelsec/v0/seg0.ts').status_code == 403
+
+
+# =============================================================================
+# Per-stream health
+# =============================================================================
+
+class _FakeProc:
+    def __init__(self, alive=True, rc=None):
+        self._alive, self._rc = alive, rc
+    def is_alive(self): return self._alive
+    @property
+    def pid(self): return 4242
+    def uptime(self): return 12.5
+    @property
+    def returncode(self): return self._rc
+    def tail_stderr(self, n=5): return ['err line'] if not self._alive else []
+
+
+class TestStreamHealth:
+    def test_inactive_stream(self, client):
+        r = client.get('/api/streams/nostream/health')
+        assert r.status_code == 200
+        data = json.loads(r.data)
+        assert data['status'] == 'inactive'
+        for k in ('recording', 'pull', 'abr', 'timestamp'):
+            assert k in data
+
+    def test_viewer_can_read_health(self, viewer_client):
+        assert viewer_client.get('/api/streams/foo/health').status_code == 200
+
+    def test_invalid_name_rejected(self, client):
+        assert client.get('/api/streams/a..b/health').status_code == 400
+
+    def test_active_recording_is_healthy(self, client):
+        from app.api import streams as st
+        with st.recording_lock:
+            st.active_recordings['hlth1'] = {'process': _FakeProc(alive=True), 'file': 'x'}
+        try:
+            data = json.loads(client.get('/api/streams/hlth1/health').data)
+            assert data['recording']['active'] is True
+            assert data['status'] == 'healthy'
+        finally:
+            with st.recording_lock:
+                st.active_recordings.pop('hlth1', None)
+
+    def test_dead_recording_is_down(self, client):
+        from app.api import streams as st
+        with st.recording_lock:
+            st.active_recordings['hlth2'] = {'process': _FakeProc(alive=False, rc=1), 'file': 'x'}
+        try:
+            data = json.loads(client.get('/api/streams/hlth2/health').data)
+            assert data['status'] == 'down'
+            assert data['recording']['recent_stderr'] == ['err line']
+        finally:
+            with st.recording_lock:
+                st.active_recordings.pop('hlth2', None)
+
+
+# =============================================================================
 # Test Runner (when executed directly)
 # =============================================================================
 

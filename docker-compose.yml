@@ -20,6 +20,9 @@ services:
       # PKI: drop the real SPASA ca.crt/crl.pem + a server.crt/server.key here at
       # deploy time, or run nginx/pki/gen-dev-pki.sh for local testing. git-ignored.
       - ./nginx/pki:/etc/nginx/pki:ro
+      # Read-only HLS dir so nginx can serve segments via X-Accel-Redirect (the app
+      # still makes the access decision). Must match the media service's HLS path.
+      - ./data/hls:/opt/app/hls:ro
     environment:
       # Only these names are substituted into the conf template; nginx's own
       # $variables are left intact (see the template header).
@@ -75,8 +78,13 @@ services:
       # CERT_DEFAULT_ROLE unset = fail-closed (unmapped cert gets no role).
       # Map CN->role in ./data/cert_roles.json (git-ignored).
       # - CERT_DEFAULT_ROLE=viewer
-      # --- HLS fail-closed ---
+      # --- HLS fail-closed + data-plane offload to nginx ---
       - HLS_REQUIRE_AUTH=${HLS_REQUIRE_AUTH:-true}
+      - HLS_X_ACCEL=${HLS_X_ACCEL:-true}
+      # --- Observability ---
+      - LOG_JSON=${LOG_JSON:-true}
+      # - AUDIT_SYSLOG_HOST=siem.internal   # ship audit trail to your SIEM
+      # - AUDIT_SYSLOG_PORT=514
       # --- App -> MediaMTX control API credentials (match the MTX_ override below) ---
       - MEDIAMTX_API_USER=control
       - MEDIAMTX_API_PASS=${MEDIAMTX_API_PASS:-mediamtx-change-me}

@@ -12,6 +12,7 @@ import os
 import stat
 import sys
 import time
+import logging
 
 import pytest
 
@@ -628,3 +629,79 @@ class TestMtlsConfigValidation:
         monkeypatch.setattr(config, 'DEV_MODE', False)
         with pytest.raises(ConfigError):
             config.validate_runtime_config()
+
+
+# ---------------------------------------------------------------------------
+# Observability — structured JSON logs + correlation (Fase 4)
+# ---------------------------------------------------------------------------
+
+class TestJsonLogging:
+    def _record(self, msg='hello'):
+        return logging.LogRecord('app.test', logging.INFO, __file__, 1, msg, None, None)
+
+    def test_json_formatter_emits_valid_json(self):
+        from app import JsonFormatter
+        import json as _json
+        rec = self._record('hello world')
+        rec.correlation_id = 'abc123'
+        out = JsonFormatter().format(rec)
+        obj = _json.loads(out)
+        assert obj['level'] == 'INFO'
+        assert obj['logger'] == 'app.test'
+        assert obj['msg'] == 'hello world'
+        assert obj['correlation_id'] == 'abc123'
+
+    def test_correlation_filter_defaults_outside_request(self):
+        from app import _CorrelationFilter
+        rec = self._record()
+        assert _CorrelationFilter().filter(rec) is True
+        assert rec.correlation_id == '-'   # no request context
+
+
+# ---------------------------------------------------------------------------
+# Observability — tamper-evident audit hash-chain (Fase 4)
+# ---------------------------------------------------------------------------
+
+class TestAuditChain:
+    def _patch_audit(self, monkeypatch, tmp_path):
+        from app import auth
+        monkeypatch.setattr(auth, '_AUDIT_LOG_FILE', str(tmp_path / 'audit.log'))
+        monkeypatch.setattr(auth, '_AUDIT_CHAIN_FILE', str(tmp_path / 'audit.chain'))
+        return auth
+
+    def test_records_are_json_lines(self, tmp_path, monkeypatch):
+        import json as _json
+        auth = self._patch_audit(monkeypatch, tmp_path)
+        auth.audit_log('login', 'ok', user='alice')
+        entries = auth.read_audit_log()
+        rec = _json.loads(entries[-1])
+        assert rec['user'] == 'alice' and rec['action'] == 'login'
+        assert 'hash' in rec and 'prev_hash' in rec
+
+    def test_intact_chain_verifies(self, tmp_path, monkeypatch):
+        auth = self._patch_audit(monkeypatch, tmp_path)
+        for i in range(5):
+            auth.audit_log('act', f'detail {i}', user=f'u{i}')
+        result = auth.verify_audit_chain()
+        assert result['ok'] is True and result['count'] == 5 and result['broken_line'] is None
+
+    def test_tamper_breaks_chain(self, tmp_path, monkeypatch):
+        import json as _json
+        auth = self._patch_audit(monkeypatch, tmp_path)
+        for i in range(4):
+            auth.audit_log('act', f'detail {i}', user=f'u{i}')
+        # Edit line 2 in place
+        lines = open(auth._AUDIT_LOG_FILE).read().splitlines()
+        rec = _json.loads(lines[1]); rec['detail'] = 'EVIL'; lines[1] = _json.dumps(rec)
+        open(auth._AUDIT_LOG_FILE, 'w').write('\n'.join(lines) + '\n')
+        result = auth.verify_audit_chain()
+        assert result['ok'] is False and result['broken_line'] == 2
+
+    def test_deletion_breaks_chain(self, tmp_path, monkeypatch):
+        auth = self._patch_audit(monkeypatch, tmp_path)
+        for i in range(4):
+            auth.audit_log('act', f'd{i}', user='u')
+        lines = open(auth._AUDIT_LOG_FILE).read().splitlines()
+        del lines[1]  # remove a record
+        open(auth._AUDIT_LOG_FILE, 'w').write('\n'.join(lines) + '\n')
+        assert auth.verify_audit_chain()['ok'] is False

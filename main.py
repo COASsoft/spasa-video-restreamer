@@ -89,6 +89,11 @@ def monitor_streams_for_auto_record():
     _blocklist_mtx = MediaMTXClient(MEDIAMTX_API_URL, user=MEDIAMTX_API_USER,
                                     password=MEDIAMTX_API_PASS, token=MEDIAMTX_API_TOKEN)
 
+    from app.websocket.broadcast import broadcast
+    from app.api.streams import _collect_stream_health
+    _last_health_bcast = 0.0
+    _HEALTH_BCAST_INTERVAL = 10.0  # seconds
+
     while True:
         try:
             # Check if health monitoring / auto-record is enabled
@@ -228,6 +233,18 @@ def monitor_streams_for_auto_record():
                             logger.info(f"Blocklist enforcement: kicked {ip} ({conn_type}/{conn_id})")
         except Exception as e:
             logger.debug(f"Blocklist enforcement error: {e}")
+
+        # Periodically broadcast per-stream health (throttled, independent of
+        # auto-record) so UIs get live process health without polling.
+        try:
+            now = time.monotonic()
+            if now - _last_health_bcast >= _HEALTH_BCAST_INTERVAL:
+                _last_health_bcast = now
+                active = set(app_state.active_recordings) | set(app_state.active_pull_streams)
+                for stream_name in active:
+                    broadcast('stream_health', _collect_stream_health(stream_name))
+        except Exception as e:
+            logger.debug(f"stream_health broadcast error: {e}")
 
         # Check every 2 seconds
         time.sleep(2)

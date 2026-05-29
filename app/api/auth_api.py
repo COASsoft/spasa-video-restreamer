@@ -13,7 +13,7 @@ from flask import Blueprint, request, jsonify
 from flask_login import login_user, logout_user, current_user
 
 from app.auth import (
-    _check_credentials, auth_required, audit_log, read_audit_log,
+    _check_credentials, auth_required, audit_log, read_audit_log, verify_audit_chain,
     generate_api_key, revoke_api_key, list_api_keys,
     _DEFAULT_CREDS, _ROLE_RANK, ROLE_VIEWER,
 )
@@ -129,6 +129,14 @@ def delete_api_key(key_hash):
 @auth_bp.route('/api/audit', methods=['GET'])
 @auth_required
 def get_audit_log():
-    """Return recent audit log entries."""
+    """Return recent audit log entries (JSON-lines records)."""
     lines = int(request.args.get('lines', 200))
     return jsonify({'entries': read_audit_log(lines)})
+
+
+@auth_bp.route('/api/audit/verify', methods=['GET'])
+@auth_required
+def verify_audit():
+    """Verify the audit hash-chain (admin). Reports the first broken line, if any."""
+    result = verify_audit_chain()
+    return jsonify(result), (200 if result.get('ok') else 409)

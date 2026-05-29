@@ -14,17 +14,21 @@ Credentials come from environment variables:
 API keys are stored in DATA_DIR/api_keys.json
 """
 import os
+import json
 import logging
 import functools
+import threading
+from logging.handlers import SysLogHandler
 from datetime import datetime, timezone
 
 from flask import request, jsonify, redirect, url_for, session, g
 from flask_login import LoginManager, UserMixin, login_user, logout_user, current_user, login_required
 
 from app.config import (DATA_DIR, MTLS_ENABLED, PROXY_SHARED_SECRET, CERT_ROLE_MAP_FILE,
-                        CERT_DEFAULT_ROLE, API_KEY_DEFAULT_ROLE)
+                        CERT_DEFAULT_ROLE, API_KEY_DEFAULT_ROLE, SECRET_KEY,
+                        AUDIT_SYSLOG_HOST, AUDIT_SYSLOG_PORT)
 from app.utils.atomic_json import write_json_atomic, read_json
-from app.utils.crypto import sha256_hex, constant_time_equals, generate_token
+from app.utils.crypto import sha256_hex, constant_time_equals, generate_token, hmac_sha256_hex
 
 logger = logging.getLogger(__name__)
 
@@ -324,10 +328,40 @@ def _wants_json():
 # ---------------------------------------------------------------------------
 
 _AUDIT_LOG_FILE = os.path.join(DATA_DIR, 'audit.log')
+_AUDIT_CHAIN_FILE = os.path.join(DATA_DIR, 'audit.chain')
+_AUDIT_GENESIS = '0' * 64
+# Serialise the chain read-modify-write so concurrent requests can't corrupt it.
+_audit_lock = threading.Lock()
+
+
+def _canonical(record: dict) -> str:
+    """Stable serialisation of a record's base fields (excludes prev_hash/hash),
+    so the chain hash is reproducible on verify."""
+    base = {k: record[k] for k in ('ts', 'user', 'action', 'detail', 'dn', 'request_id')}
+    return json.dumps(base, sort_keys=True, separators=(',', ':'))
+
+
+def _audit_chain_hash(prev_hash: str, record: dict) -> str:
+    """HMAC over (prev_hash + canonical record) — links each entry to the previous."""
+    return hmac_sha256_hex(SECRET_KEY, prev_hash + _canonical(record))
+
+
+# Dedicated audit logger; only gains a syslog/SIEM handler when configured.
+_audit_syslog = logging.getLogger('audit.siem')
+_audit_syslog.propagate = False
+if AUDIT_SYSLOG_HOST:
+    try:
+        _audit_syslog.addHandler(SysLogHandler(address=(AUDIT_SYSLOG_HOST, AUDIT_SYSLOG_PORT)))
+        _audit_syslog.setLevel(logging.INFO)
+    except Exception as e:  # never let a bad SIEM endpoint break auditing
+        logger.error(f"Audit syslog handler init failed: {e}")
 
 
 def audit_log(action: str, detail: str = '', user: str = ''):
-    """Append a line to the audit log file."""
+    """Append a tamper-evident JSON-lines audit record (and ship it to SIEM if set).
+
+    Each record carries prev_hash + hash where hash = HMAC(SECRET_KEY, prev_hash +
+    canonical(record)); any edit/removal breaks the chain (see verify_audit_chain)."""
     if not user:
         try:
             if current_user.is_authenticated:
@@ -338,35 +372,81 @@ def audit_log(action: str, detail: str = '', user: str = ''):
         except Exception:
             pass
         if not user:
-            user = request.remote_addr if request else 'system'
-    # For mTLS requests, attach the full cert DN for traceability.
+            try:
+                user = request.remote_addr if request else 'system'
+            except Exception:
+                user = 'system'
+    dn = ''
+    rid = ''
     try:
-        dn = getattr(g, 'cert_dn', None)
-        if dn:
-            detail = f'{detail} | dn={dn}' if detail else f'dn={dn}'
+        dn = getattr(g, 'cert_dn', None) or ''
+        rid = getattr(g, 'request_id', None) or ''
     except Exception:
         pass
-    ts = datetime.now(timezone.utc).isoformat()
-    line = f"{ts} | {user} | {action} | {detail}\n"
+    record = {
+        'ts': datetime.now(timezone.utc).isoformat(),
+        'user': user,
+        'action': action,
+        'detail': detail,
+        'dn': dn,
+        'request_id': rid,
+    }
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
-        with open(_AUDIT_LOG_FILE, 'a') as f:
-            f.write(line)
+        with _audit_lock:
+            state = read_json(_AUDIT_CHAIN_FILE, default={}) or {}
+            prev_hash = state.get('last_hash', _AUDIT_GENESIS)
+            record['prev_hash'] = prev_hash
+            record['hash'] = _audit_chain_hash(prev_hash, record)
+            with open(_AUDIT_LOG_FILE, 'a') as f:
+                f.write(json.dumps(record) + '\n')
+            write_json_atomic(_AUDIT_CHAIN_FILE, {'last_hash': record['hash']})
+        _audit_syslog.info(json.dumps(record))
     except Exception as e:
         logger.error(f"Audit log write error: {e}")
 
 
 def read_audit_log(lines: int = 200) -> list:
-    """Return the last N lines of the audit log."""
+    """Return the last N audit records (JSON strings, one per line)."""
     try:
         if not os.path.exists(_AUDIT_LOG_FILE):
             return []
         with open(_AUDIT_LOG_FILE, 'r') as f:
             all_lines = f.readlines()
-        return [l.strip() for l in all_lines[-lines:]]
+        return [l.strip() for l in all_lines[-lines:] if l.strip()]
     except Exception as e:
         logger.error(f"Audit log read error: {e}")
         return []
+
+
+def verify_audit_chain() -> dict:
+    """Recompute the hash chain over the whole audit log.
+
+    Returns {ok, count, broken_line} — broken_line is the 1-based line number of the
+    first record whose hash/prev_hash doesn't match (None when intact)."""
+    try:
+        if not os.path.exists(_AUDIT_LOG_FILE):
+            return {'ok': True, 'count': 0, 'broken_line': None}
+        prev = _AUDIT_GENESIS
+        count = 0
+        with open(_AUDIT_LOG_FILE, 'r') as f:
+            for i, raw in enumerate(f, start=1):
+                raw = raw.strip()
+                if not raw:
+                    continue
+                count += 1
+                try:
+                    rec = json.loads(raw)
+                except ValueError:
+                    return {'ok': False, 'count': count, 'broken_line': i}
+                expected = _audit_chain_hash(prev, rec)
+                if rec.get('prev_hash') != prev or not constant_time_equals(rec.get('hash', ''), expected):
+                    return {'ok': False, 'count': count, 'broken_line': i}
+                prev = rec['hash']
+        return {'ok': True, 'count': count, 'broken_line': None}
+    except Exception as e:
+        logger.error(f"Audit chain verify error: {e}")
+        return {'ok': False, 'count': 0, 'broken_line': None, 'error': str(e)}
 
 
 # ---------------------------------------------------------------------------

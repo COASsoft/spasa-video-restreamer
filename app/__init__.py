@@ -9,6 +9,8 @@ Flask application factory
 """
 import os
 import re
+import json
+import uuid
 import logging
 from logging.handlers import RotatingFileHandler
 from flask import Flask, send_from_directory, redirect, url_for, request, jsonify, g
@@ -16,7 +18,8 @@ from flask_cors import CORS
 from flask_socketio import SocketIO
 
 # Import configuration and state
-from app.config import SECRET_KEY, PORT, CORS_ORIGINS, LOG_LEVEL, LOGS_DIR, LOG_MAX_BYTES, LOG_BACKUP_COUNT, validate_runtime_config
+from app.config import (SECRET_KEY, PORT, CORS_ORIGINS, LOG_LEVEL, LOGS_DIR, LOG_MAX_BYTES,
+                        LOG_BACKUP_COUNT, LOG_JSON, validate_runtime_config)
 
 # Import blueprints
 from app.api import health_bp, streams_bp, recordings_bp, settings_bp, utils_bp, test_bp, hls_bp, auth_bp, tls_bp, metrics_bp
@@ -179,6 +182,13 @@ def create_app():
                         '/login', '/static/', '/hls/', '/api/hls/proxy/')
     _PAGE_ROUTES = ('/', '/recordings', '/settings', '/utils', '/test', '/videowall')
 
+    # Correlation id for every request (registered before the auth gate so it runs
+    # first and covers public paths too). Prefer the id nginx forwards (X-Request-ID)
+    # for cross-tier correlation; otherwise originate one.
+    @app.before_request
+    def _assign_request_id():
+        g.request_id = request.headers.get('X-Request-ID') or uuid.uuid4().hex
+
     @app.before_request
     def _enforce_auth():
         path, method = request.path, request.method
@@ -217,6 +227,10 @@ def create_app():
             response.headers.setdefault(
                 'Strict-Transport-Security', 'max-age=31536000; includeSubDomains'
             )
+        # Echo the correlation id so clients/log collectors can stitch a request together.
+        rid = getattr(g, 'request_id', None)
+        if rid:
+            response.headers.setdefault('X-Request-ID', rid)
         return response
 
     # Static file routes (protected by auth)
@@ -266,31 +280,70 @@ def create_app():
     return app
 
 
+class _CorrelationFilter(logging.Filter):
+    """Attach the per-request correlation id to every record (``-`` when there is
+    no request context, e.g. background threads/startup)."""
+    def filter(self, record):
+        rid = '-'
+        try:
+            rid = getattr(g, 'request_id', '-') or '-'
+        except Exception:
+            rid = '-'
+        record.correlation_id = rid
+        return True
+
+
+class JsonFormatter(logging.Formatter):
+    """Dependency-free structured JSON log formatter (one object per line)."""
+    def format(self, record):
+        payload = {
+            'ts': self.formatTime(record),
+            'level': record.levelname,
+            'logger': record.name,
+            'correlation_id': getattr(record, 'correlation_id', '-'),
+            'msg': record.getMessage(),
+        }
+        if record.exc_info:
+            payload['exc'] = self.formatException(record.exc_info)
+        return json.dumps(payload, default=str)
+
+
 def setup_logging():
-    """Configure application logging with rotation"""
+    """Configure application logging with rotation.
+
+    LOG_JSON=true emits structured JSON with a correlation id (for SIEM/log
+    collectors); otherwise the human-readable format is kept (dev default).
+    """
     os.makedirs(LOGS_DIR, exist_ok=True)
-    
-    # Create rotating file handler
+
+    if LOG_JSON:
+        formatter = JsonFormatter()
+    else:
+        formatter = logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - [%(correlation_id)s] - %(message)s'
+        )
+    corr_filter = _CorrelationFilter()
+
     log_file = os.path.join(LOGS_DIR, 'app.log')
     file_handler = RotatingFileHandler(
         log_file,
         maxBytes=LOG_MAX_BYTES,
         backupCount=LOG_BACKUP_COUNT
     )
-    file_handler.setFormatter(logging.Formatter(
-        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    ))
-    
-    # Configure root logger
+    file_handler.setFormatter(formatter)
+    file_handler.addFilter(corr_filter)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    console_handler.addFilter(corr_filter)
+
+    # Configure root logger (force=True so re-init in tests/factory takes effect).
     logging.basicConfig(
         level=getattr(logging, LOG_LEVEL),
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.StreamHandler(),  # Console output
-            file_handler  # Rotating file output
-        ]
+        handlers=[console_handler, file_handler],
+        force=True,
     )
-    
+
     # Set specific loggers to WARNING to reduce noise
     logging.getLogger('werkzeug').setLevel(logging.WARNING)
     logging.getLogger('engineio').setLevel(logging.WARNING)
