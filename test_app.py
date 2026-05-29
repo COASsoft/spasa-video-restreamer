@@ -559,6 +559,43 @@ class TestMetrics:
         assert 'tvr_streams_dir_free_bytes' in body
 
 
+class TestRecordingLifecycle:
+    """Unified recording path (begin_recording + stop endpoint), hermetic:
+    a fake FFmpeg that writes its output and exits on stdin 'q'. No MediaMTX,
+    no real ffmpeg recording, no port. Covers the schema-consistency and the
+    graceful-quit + race-safe cleanup fixes that unify auto/manual recording.
+    """
+
+    def test_begin_and_stop_recording(self, client, tmp_path):
+        from app.api import recordings as rec
+        out = str(tmp_path / 'rec.mov')
+        # Fake ffmpeg: write the output file, then block on stdin until 'q'.
+        cmd = [sys.executable, '-u', '-c',
+               'import sys; open(sys.argv[1], "w").write("data"); '
+               'sys.exit(0 if sys.stdin.read(1) == "q" else 1)', out]
+        with patch('app.api.recordings.broadcast'):
+            proc = rec.begin_recording('hermetic1', cmd, out, codec='h264',
+                                       timecode='00:00:00:00', auto_started=False)
+        assert proc is not None
+        entry = rec.active_recordings.get('hermetic1')
+        assert entry is not None
+        # Consistent schema shared by auto + manual recordings.
+        for key in ('process', 'file', 'startTime', 'pid', 'codec', 'auto_started'):
+            assert key in entry
+        assert entry['file'] == out and entry['codec'] == 'h264'
+
+        # Stop via the real endpoint: graceful 'q', race-safe pop, no KeyError.
+        resp = client.post('/api/streams/hermetic1/stop-record', json={})
+        assert resp.status_code == 200
+        assert 'partial cleanup' not in resp.get_data(as_text=True)
+        assert 'hermetic1' not in rec.active_recordings
+
+    def test_stop_unknown_recording_is_idempotent(self, client):
+        resp = client.post('/api/streams/does-not-exist/stop-record', json={})
+        assert resp.status_code == 200
+        assert 'already stopped' in resp.get_data(as_text=True).lower()
+
+
 # =============================================================================
 # Settings Tests
 # =============================================================================

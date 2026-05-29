@@ -14,7 +14,6 @@ import time
 import logging
 import requests
 from datetime import datetime, timezone
-import subprocess
 import os
 
 from app import create_app
@@ -28,6 +27,7 @@ from app.websocket.broadcast import broadcast
 from app.services.standby import standby_manager
 from app.services.cleanup import start_cleanup_service
 from app.services.mediamtx import MediaMTXClient
+from app.api.recordings import begin_recording
 
 logger = logging.getLogger(__name__)
 
@@ -169,32 +169,22 @@ def monitor_streams_for_auto_record():
                                             output_path
                                         ])
 
-                                        # Start FFmpeg process
-                                        # stderr→DEVNULL: PIPE causes deadlock after ~200s
-                                        # (64KB OS buffer fills with progress lines, FFmpeg blocks)
-                                        process = subprocess.Popen(
-                                            ffmpeg_args,
-                                            stdout=subprocess.DEVNULL,
-                                            stderr=subprocess.DEVNULL,
+                                        # Spawn + track via the unified supervisor:
+                                        # same active_recordings schema as manual
+                                        # recordings (fixes the old divergence that
+                                        # left auto-records unstoppable), captured
+                                        # stderr, and graceful 'q' quit on stop.
+                                        proc = begin_recording(
+                                            stream_name, ffmpeg_args, output_path,
+                                            codec=stream_info.get('codec', 'h264'),
+                                            has_data=has_data,
+                                            auto_started=True,
+                                            start_dt=now,
                                         )
-
-                                        # Store recording info
-                                        with recording_lock:
-                                            active_recordings[stream_name] = {
-                                                'process': process,
-                                                'filename': filename,
-                                                'output_path': output_path,
-                                                'start_time': now.isoformat(),
-                                                'auto_started': True
-                                            }
-
-                                        logger.info(f"Auto-record started for {stream_name}: {filename}")
-                                        broadcast('recording_started', {
-                                            'stream': stream_name,
-                                            'filename': filename,
-                                            'hasKlv': has_data,
-                                            'auto_started': True
-                                        })
+                                        if proc:
+                                            logger.info(f"Auto-record started for {stream_name}: {filename}")
+                                        else:
+                                            logger.error(f"Auto-record: FFmpeg failed to start for {stream_name}")
 
                                 except Exception as e:
                                     logger.error(f"Error auto-starting recording for {stream_name}: {e}")
