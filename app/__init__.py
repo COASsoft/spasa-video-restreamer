@@ -22,7 +22,7 @@ from app.config import (SECRET_KEY, PORT, CORS_ORIGINS, LOG_LEVEL, LOGS_DIR, LOG
                         LOG_BACKUP_COUNT, LOG_JSON, validate_runtime_config)
 
 # Import blueprints
-from app.api import health_bp, streams_bp, recordings_bp, settings_bp, utils_bp, test_bp, hls_bp, auth_bp, tls_bp, metrics_bp
+from app.api import health_bp, streams_bp, recordings_bp, settings_bp, utils_bp, test_bp, hls_bp, auth_bp, tls_bp, metrics_bp, klv_bp, dvr_bp
 
 # Import websocket handlers
 from app.websocket import set_socketio, register_handlers
@@ -164,6 +164,8 @@ def create_app():
     app.register_blueprint(auth_bp)
     app.register_blueprint(tls_bp)
     app.register_blueprint(metrics_bp)
+    app.register_blueprint(klv_bp)
+    app.register_blueprint(dvr_bp)
 
     # Apply rate limiting to login endpoint
     if app.limiter:
