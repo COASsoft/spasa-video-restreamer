@@ -10,13 +10,15 @@ Test Pattern API endpoints
 import logging
 import os
 import re
+import subprocess
+import threading
 import time
 import uuid
 from flask import Blueprint, request, jsonify
 
 from app.config import FFMPEG_LOG_DIR
 from app.utils.validation import is_valid_stream_name
-from app.services.process import ManagedProcess
+from app.services.process import ManagedProcess, supervise
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +26,64 @@ test_bp = Blueprint('test', __name__, url_prefix='/api/test')
 
 # Store active test processes
 active_tests = {}
+
+
+class _SupervisedTest:
+    """A continuous test pattern kept alive across transient publisher drops.
+
+    A bare ``ManagedProcess`` does not recover if MediaMTX drops the publisher
+    (observed as ffmpeg 'Broken pipe' -> exit), which silently kills the source any
+    DVR ring buffer reading that path depends on. Running ffmpeg under ``supervise()``
+    restarts it with capped backoff until stopped. Mirrors the ``ManagedProcess``
+    teardown subset every consumer uses — ``poll``/``stop`` (the test endpoints) and
+    ``terminate``/``wait``/``kill`` (``streams._terminate_process`` on stream stop) — so
+    no call site needs to special-case the supervised variant.
+    """
+
+    def __init__(self, name: str, cmd, log_dir: str, label: str = None):
+        self._stop = threading.Event()
+        self._make = lambda: ManagedProcess(name, cmd, log_dir, label=label)
+        self._thread = threading.Thread(
+            target=lambda: supervise(self._make, self._stop.is_set),
+            daemon=True)
+
+    def start(self) -> bool:
+        self._thread.start()
+        return True
+
+    def poll(self):
+        # None == still running (alive or reconnecting); non-None == stopped.
+        return None if (self._thread.is_alive() and not self._stop.is_set()) else 0
+
+    def terminate(self):
+        # Signal supervise() to tear the current ffmpeg child down and exit its loop.
+        # There is no softer/harder variant: supervise() already escalates SIGTERM ->
+        # SIGKILL on the child via ManagedProcess.stop(), so kill() is the same signal.
+        self._stop.set()
+
+    kill = terminate
+
+    def wait(self, timeout=None):
+        """Join the supervisor thread; raise TimeoutExpired like subprocess.wait()."""
+        self._thread.join(timeout=timeout)
+        if timeout is not None and self._thread.is_alive():
+            raise subprocess.TimeoutExpired(cmd='supervised-test', timeout=timeout)
+        return 0
+
+    def stop(self, term_timeout: float = 3.0):
+        # supervise() tears the current ffmpeg child down within ~0.25s of this.
+        self._stop.set()
+        self._thread.join(timeout=term_timeout)
+
+
+def _make_test_process(protocol: str, stream_name: str, cmd, duration: int):
+    """One-shot ManagedProcess for finite tests; a supervised wrapper for continuous
+    (``duration == 0``) ones so the source survives a transient publisher drop."""
+    name = f'test-{stream_name}'
+    label = f'test:{protocol}:{stream_name}'
+    if duration == 0:
+        return _SupervisedTest(name, cmd, FFMPEG_LOG_DIR, label=label)
+    return ManagedProcess(name, cmd, FFMPEG_LOG_DIR, label=label)
 
 
 def _validate_stream_name(name: str) -> bool:
@@ -125,8 +185,7 @@ def _start_test(protocol: str):
     logger.info(f"Starting {label} test pattern: {stream_name} ({resolution} {framerate}fps {pattern}) "
                 f"{'continuous' if duration == 0 else f'{duration}s'}")
 
-    process = ManagedProcess(f'test-{stream_name}', cmd, FFMPEG_LOG_DIR,
-                             label=f'test:{protocol}:{stream_name}')
+    process = _make_test_process(protocol, stream_name, cmd, duration)
     if not process.start():
         return jsonify({'success': False, 'error': 'Failed to start FFmpeg'}), 500
     active_tests[test_id] = {

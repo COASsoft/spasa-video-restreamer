@@ -543,6 +543,190 @@ class TestPatternGenerator:
 
 
 # =============================================================================
+# DVR ring-buffer readiness + status tests
+# =============================================================================
+
+class TestDvrSourceReadiness:
+    """The DVR records via RTSP from MediaMTX; when no publisher is on the path an
+    RTSP DESCRIBE 404s. These cover the readiness probe (so ffmpeg isn't crash-looped
+    into a 404) and the additive 'source-offline' status surfaced to the endpoints."""
+
+    def test_probe_ready_when_path_publishing(self):
+        from app.api import dvr
+        c = MagicMock()
+        c.get_path.return_value = {'ready': True}
+        assert dvr._probe_source_ready(c, 'cam1') == 'ready'
+        c.list_paths.assert_not_called()  # ready short-circuits the reachability check
+
+    def test_probe_offline_when_path_known_but_not_ready(self):
+        from app.api import dvr
+        c = MagicMock()
+        c.get_path.return_value = {'ready': False}
+        assert dvr._probe_source_ready(c, 'cam1') == 'offline'
+
+    def test_probe_offline_when_no_publisher_but_api_up(self):
+        from app.api import dvr
+        c = MagicMock()
+        c.get_path.return_value = None   # 404: no publisher on the path
+        c.list_paths.return_value = []   # ...but the API is reachable
+        assert dvr._probe_source_ready(c, 'cam1') == 'offline'
+
+    def test_probe_unknown_when_api_unreachable(self):
+        from app.api import dvr
+        c = MagicMock()
+        c.get_path.return_value = None
+        c.list_paths.return_value = None  # API down -> degrade to attempting ffmpeg
+        assert dvr._probe_source_ready(c, 'cam1') == 'unknown'
+
+    @staticmethod
+    def _install_fake_recorder(name, health):
+        """Insert a stub recorder into the DVR registry so the HTTP endpoints can be
+        exercised without spawning ffmpeg, MediaMTX, or the supervisor thread."""
+        from app.api import dvr
+
+        class _FakeRec:
+            seg_dir = '/tmp'
+            def running(self):
+                return True
+            def health(self):
+                return health
+            def recent_segments(self, seconds):
+                return []  # empty buffer -> exercise the clip 409 path
+
+        with dvr._recorders_lock:
+            dvr._recorders[name] = _FakeRec()
+
+    @staticmethod
+    def _remove_fake_recorder(name):
+        from app.api import dvr
+        with dvr._recorders_lock:
+            dvr._recorders.pop(name, None)
+
+    def test_status_reports_source_offline_cleanly(self, client):
+        from app.api import dvr
+        self._install_fake_recorder('off-cam', {
+            'segmentCount': 0, 'newestAgeS': None, 'recording': False,
+            'lastReason': dvr._REASON_SOURCE_OFFLINE, 'sourceOffline': True,
+            'stderrTail': ['stale 404 tail that should not surface'],
+        })
+        try:
+            r = client.get('/api/streams/off-cam/dvr/status')
+            assert r.status_code == 200
+            d = json.loads(r.data)
+            assert d['sourceOffline'] is True
+            assert d['recording'] is False
+            assert d['lastError']['reason'] == 'source-offline'
+            assert d['lastError']['stderr'] == []  # the misleading ffmpeg tail is suppressed
+        finally:
+            self._remove_fake_recorder('off-cam')
+
+    def test_status_reports_ffmpeg_failure_with_tail(self, client):
+        """Regression: a genuine ffmpeg exit still surfaces its stderr tail."""
+        self._install_fake_recorder('err-cam', {
+            'segmentCount': 0, 'newestAgeS': None, 'recording': False,
+            'lastReason': 'exited', 'sourceOffline': False,
+            'stderrTail': ['ffmpeg: codec not supported'],
+        })
+        try:
+            r = client.get('/api/streams/err-cam/dvr/status')
+            d = json.loads(r.data)
+            assert d['sourceOffline'] is False
+            assert d['lastError']['reason'] == 'exited'
+            assert d['lastError']['stderr'] == ['ffmpeg: codec not supported']
+        finally:
+            self._remove_fake_recorder('err-cam')
+
+    def test_clip_409_flags_source_offline(self, client):
+        from app.api import dvr
+        self._install_fake_recorder('off-cam2', {
+            'segmentCount': 0, 'newestAgeS': None, 'recording': False,
+            'lastReason': dvr._REASON_SOURCE_OFFLINE, 'sourceOffline': True,
+            'stderrTail': [],
+        })
+        try:
+            r = client.post('/api/streams/off-cam2/dvr/clip', json={'seconds': 30})
+            assert r.status_code == 409
+            d = json.loads(r.data)
+            assert d['sourceOffline'] is True
+            assert d['detail'] == 'Source not publishing yet'
+            assert d['error'] == 'No buffered footage yet'  # unchanged for back-compat
+        finally:
+            self._remove_fake_recorder('off-cam2')
+
+    def test_clip_409_buffer_still_filling(self, client):
+        self._install_fake_recorder('fill-cam', {
+            'segmentCount': 0, 'newestAgeS': None, 'recording': False,
+            'lastReason': None, 'sourceOffline': False, 'stderrTail': [],
+        })
+        try:
+            r = client.post('/api/streams/fill-cam/dvr/clip', json={'seconds': 30})
+            assert r.status_code == 409
+            d = json.loads(r.data)
+            assert d['sourceOffline'] is False
+            assert d['detail'] == 'Buffer still filling'
+        finally:
+            self._remove_fake_recorder('fill-cam')
+
+
+class TestSupervisedTestPattern:
+    """Continuous (duration=0) test patterns run under supervise() so a transient
+    publisher drop auto-restarts instead of silently killing the DVR's source."""
+
+    def test_continuous_uses_supervised_wrapper(self, client):
+        from app.api import test as test_mod
+        with patch('app.api.test.ManagedProcess') as MockMP:
+            inst = MockMP.return_value
+            inst.start.return_value = True
+            inst.poll.return_value = None
+            inst.tail_stderr.return_value = []
+            r = client.post('/api/test/rtsp',
+                            json={'streamName': 'soak-cam', 'duration': 0})
+            assert r.status_code == 200
+            tid = json.loads(r.data)['testId']
+            try:
+                proc = test_mod.active_tests[tid]['process']
+                assert isinstance(proc, test_mod._SupervisedTest)
+                assert proc.poll() is None  # alive / reconnecting
+            finally:
+                client.post(f'/api/test/{tid}/stop')
+            assert tid not in test_mod.active_tests  # stop cleaned it up
+
+    def test_finite_uses_one_shot_managed_process(self, client):
+        from app.api import test as test_mod
+        with patch('app.api.test.ManagedProcess') as MockMP:
+            inst = MockMP.return_value
+            inst.start.return_value = True
+            inst.poll.return_value = None
+            r = client.post('/api/test/rtsp',
+                            json={'streamName': 'finite-cam', 'duration': 30})
+            assert r.status_code == 200
+            tid = json.loads(r.data)['testId']
+            try:
+                proc = test_mod.active_tests[tid]['process']
+                assert proc is inst  # raw ManagedProcess, not the supervised wrapper
+            finally:
+                client.post(f'/api/test/{tid}/stop')
+
+    def test_supervised_test_terminable_by_stream_stop_path(self):
+        """Regression: streams._stop_stream_components() tears down the stored test
+        process with _terminate_process(), which calls .terminate()/.wait()/.kill().
+        A continuous test stores a _SupervisedTest, so those must exist and actually
+        stop it (else AttributeError -> HTTP 500 and an orphaned republishing source)."""
+        from app.api import test as test_mod
+        from app.api import streams
+        with patch('app.api.test.ManagedProcess') as MockMP:
+            inst = MockMP.return_value
+            inst.start.return_value = True
+            inst.poll.return_value = None
+            inst.stop.return_value = None
+            proc = test_mod._SupervisedTest('test-x', ['ffmpeg'], '/tmp', label='t')
+            proc.start()
+            assert proc.poll() is None
+            streams._terminate_process(proc)  # must not AttributeError
+            assert proc.poll() is not None    # supervisor thread stopped
+
+
+# =============================================================================
 # HLS Access Validation Tests
 # =============================================================================
 

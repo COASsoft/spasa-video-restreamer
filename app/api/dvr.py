@@ -27,7 +27,9 @@ import uuid
 
 from flask import Blueprint, jsonify, request
 
-from app.config import FFMPEG_LOG_DIR
+from app.config import (FFMPEG_LOG_DIR, MEDIAMTX_API_URL, MEDIAMTX_API_USER,
+                        MEDIAMTX_API_PASS, MEDIAMTX_API_TOKEN)
+from app.services.mediamtx import MediaMTXClient
 from app.services.process import ManagedProcess, supervise
 from app.utils.validation import is_valid_stream_name
 
@@ -46,9 +48,38 @@ _RW_TIMEOUT_US = '10000000'  # 10 s input timeout so a dead RTSP socket can't ha
 _STALL_SECONDS = max(3 * _SEG_SECONDS, 20)
 _MAX_CLIP_SECONDS = _WINDOW_SECONDS
 _MAX_RECORDERS = 32
+# How often to re-probe whether the source path has a live publisher while the DVR is
+# waiting for it, so the recorder reconnects within ~one poll of the source appearing
+# instead of crash-looping ffmpeg into an RTSP 404 (or waiting out supervise()'s backoff).
+_READY_POLL_SECONDS = float(os.environ.get('DVR_READY_POLL_SECONDS', '1.5'))
+# Short per-probe HTTP timeout: a probe runs inside the recorder loop where stop is only
+# observed between probes, so an unbounded request would make dvr_stop hang on a slow API.
+_READY_PROBE_TIMEOUT = float(os.environ.get('DVR_READY_PROBE_TIMEOUT', '3'))
+_REASON_SOURCE_OFFLINE = 'source-offline'  # status reason: path has no publisher (yet)
+
+# One client for MediaMTX path-readiness probes (built like app/api/streams.py).
+_mediamtx = MediaMTXClient(MEDIAMTX_API_URL, user=MEDIAMTX_API_USER,
+                           password=MEDIAMTX_API_PASS, token=MEDIAMTX_API_TOKEN)
 
 _recorders = {}
 _recorders_lock = threading.Lock()
+
+
+def _probe_source_ready(client, name):
+    """Tri-state readiness of the MediaMTX path the DVR records from.
+
+    Returns:
+        'ready'   - a publisher is connected and the path is producing data;
+        'offline' - the API answered but the path has no live publisher (keep waiting);
+        'unknown' - the MediaMTX API is unreachable, so the caller should degrade and
+                    just attempt ffmpeg rather than block forever on a dead API.
+    """
+    path = client.get_path(name, timeout=_READY_PROBE_TIMEOUT)
+    if path is not None:
+        return 'ready' if path.get('ready', False) else 'offline'
+    # get_path() collapses 404 (no publisher) and transport errors to None. A working
+    # list_paths() proves the API is reachable, so a None here means genuinely offline.
+    return 'offline' if client.list_paths(timeout=_READY_PROBE_TIMEOUT) is not None else 'unknown'
 
 
 class _DvrRecorder:
@@ -71,7 +102,29 @@ class _DvrRecorder:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
+    def _wait_for_source(self):
+        """Block until the source path has a live publisher, or stop is requested.
+
+        Prevents ffmpeg from crash-looping on an RTSP 404 when nothing is publishing
+        yet, and surfaces a clean 'source-offline' reason instead of a stale ffmpeg
+        tail. Degrades to an immediate attempt if the MediaMTX API is unreachable (so a
+        dead API never blocks the recorder forever). Returns False iff stop was requested
+        while waiting — supervise() treats a None process as a safe no-op restart.
+        """
+        while not self._stop.is_set():
+            if _probe_source_ready(_mediamtx, self.name) in ('ready', 'unknown'):
+                self._last_reason = None  # clear offline marker before (re)starting ffmpeg
+                return True
+            # Clear stderr before setting the reason so a lock-free status read never
+            # pairs 'source-offline' with a stale ffmpeg 404 tail.
+            self._last_stderr = []
+            self._last_reason = _REASON_SOURCE_OFFLINE
+            self._stop.wait(_READY_POLL_SECONDS)  # stop-responsive sleep
+        return False
+
     def _make_process(self):
+        if not self._wait_for_source():
+            return None  # stop requested while waiting; supervise() handles None safely
         url = f"{_MEDIAMTX_RTSP_URL.rstrip('/')}/{self.name}"
         out = os.path.join(self.seg_dir, 'seg%05d.ts')
         cmd = [
@@ -134,11 +187,13 @@ class _DvrRecorder:
         """Whether footage is actually being produced, plus the last failure reason."""
         entries = self._segments()  # one directory scan; derive age inline below
         age = max(0.0, time.time() - entries[-1][0]) if entries else None
+        reason = self._last_reason  # snapshot once so lastReason/sourceOffline agree
         return {
             'segmentCount': len(entries),
             'newestAgeS': round(age, 1) if age is not None else None,
             'recording': age is not None and age <= _STALL_SECONDS,
-            'lastReason': self._last_reason,
+            'lastReason': reason,
+            'sourceOffline': reason == _REASON_SOURCE_OFFLINE,
             'stderrTail': self._last_stderr[-5:],
         }
 
@@ -197,6 +252,7 @@ def dvr_status(name):
         'recording': False,
         'segmentCount': 0,
         'newestAgeS': None,
+        'sourceOffline': False,
         'windowSeconds': _WINDOW_SECONDS,
         'segmentSeconds': _SEG_SECONDS,
     }
@@ -205,9 +261,15 @@ def dvr_status(name):
         body['recording'] = h['recording']
         body['segmentCount'] = h['segmentCount']
         body['newestAgeS'] = h['newestAgeS']
-        # Running thread but no footage being produced — expose ffmpeg's real failure.
+        body['sourceOffline'] = h['sourceOffline']
+        # Running thread but no footage being produced — expose the real reason. When the
+        # source simply isn't publishing yet, report that cleanly instead of ffmpeg's raw
+        # RTSP 404 tail (which reads like an unrelated HLS error to operators).
         if not h['recording'] and h['lastReason']:
-            body['lastError'] = {'reason': h['lastReason'], 'stderr': h['stderrTail']}
+            if h['sourceOffline']:
+                body['lastError'] = {'reason': _REASON_SOURCE_OFFLINE, 'stderr': []}
+            else:
+                body['lastError'] = {'reason': h['lastReason'], 'stderr': h['stderrTail']}
     return jsonify(body), 200
 
 
@@ -229,13 +291,21 @@ def dvr_clip(name):
         return jsonify({'success': False, 'error': 'DVR not running for this stream'}), 409
     segments = rec.recent_segments(seconds)
     if not segments:
-        # Buffer empty: distinguish "still filling" from "ffmpeg is failing" so the
-        # operator sees the real cause (RTSP refused, 404, codec, …) instead of an
-        # opaque 409. The captured stderr tail is the actual ffmpeg diagnostic.
+        # Buffer empty: distinguish "source not publishing yet" from "still filling" from
+        # "ffmpeg is failing" so the operator sees the real cause instead of an opaque 409.
         h = rec.health()
-        resp = {'success': False, 'error': 'No buffered footage yet', 'health': h}
+        resp = {
+            'success': False,
+            'error': 'No buffered footage yet',
+            'detail': 'Source not publishing yet' if h['sourceOffline'] else 'Buffer still filling',
+            'sourceOffline': h['sourceOffline'],
+            'health': h,
+        }
         if h['lastReason']:
-            resp['lastError'] = {'reason': h['lastReason'], 'stderr': h['stderrTail']}
+            if h['sourceOffline']:
+                resp['lastError'] = {'reason': _REASON_SOURCE_OFFLINE, 'stderr': []}
+            else:
+                resp['lastError'] = {'reason': h['lastReason'], 'stderr': h['stderrTail']}
         return jsonify(resp), 409
 
     out_dir = os.path.join(_STREAMS_DIR, name)
