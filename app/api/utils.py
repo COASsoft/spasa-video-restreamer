@@ -9,7 +9,9 @@ Utils API Blueprint - Utility endpoints (transcode, test patterns, etc.)
 """
 from flask import Blueprint, request, jsonify
 from pathlib import Path
+from datetime import datetime, timezone
 import subprocess
+import tempfile
 import threading
 import time
 import os
@@ -20,6 +22,7 @@ import logging
 from app.config import KLV_AVAILABLE, STREAMS_DIR
 from app.state import active_transcodes
 from app.websocket.broadcast import broadcast
+from shared.klv import parse_klv_packets
 
 logger = logging.getLogger(__name__)
 
@@ -423,6 +426,38 @@ def cancel_transcode(transcode_id):
         return jsonify({'error': str(e)}), 500
 
 
+def _shape_klv_result(packets, video_path, include_raw):
+    """Shape decoded KLV packets into the structure the utils UI consumes.
+
+    ``web/static/utils.html`` reads ``data.extraction_info.{total_packets, format,
+    include_raw_values, extraction_time}`` and ``data.packets[i].metadata``. Each parsed
+    packet carries a ``tags`` map ``{name: {tag_id, value, raw_value, raw_length}}``; we
+    expose a clean ``name -> value`` map as ``metadata`` by default, or the full per-tag
+    detail (including raw hex) when ``include_raw`` is set.
+    """
+    shaped = []
+    for p in packets:
+        tags = p.get('tags') or {}
+        if include_raw:
+            metadata = tags
+        else:
+            metadata = {name: info.get('value') for name, info in tags.items()}
+        shaped.append({
+            'timestamp': p.get('timestamp'),
+            'raw_size': p.get('raw_size'),
+            'metadata': metadata,
+        })
+    return {
+        'extraction_info': {
+            'format': (video_path.suffix.lower().lstrip('.') or 'unknown'),
+            'total_packets': len(shaped),
+            'include_raw_values': bool(include_raw),
+            'extraction_time': datetime.now(timezone.utc).isoformat(),
+        },
+        'packets': shaped,
+    }
+
+
 @utils_bp.route('/api/klv/extract', methods=['POST'])
 def extract_klv():
     """
@@ -493,76 +528,73 @@ def extract_klv():
             except Exception as e:
                 logger.warning(f"Failed to load existing extraction, re-extracting: {e}")
         
-        # Run extraction script
+        # Extract the KLV data stream in-process and decode it. The previous code
+        # shelled out to a utils/extract_video_klv.py helper that does not exist, so
+        # *every* call failed with a 500 regardless of the file's contents; we now reuse
+        # the shared STANAG 4609 framing/parser directly.
         logger.info(f"Extracting KLV from: {video_file} (include_raw={include_raw})")
-        
-        # Get path to extraction script (cross-platform)
-        script_dir = Path(__file__).parent.parent.parent / 'utils'
-        extraction_script = script_dir / 'extract_video_klv.py'
-        
-        cmd = [
-            sys.executable,  # Use current Python interpreter
-            str(extraction_script),
-            video_file
-        ]
-        
-        # Add --raw flag if requested
-        if include_raw:
-            cmd.append('--raw')
-        
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=120  # 2 minute timeout
-        )
-        
-        # Log both stdout and stderr for debugging
-        if result.stdout:
-            logger.debug(f"KLV extraction stdout: {result.stdout[:1000]}")
-        if result.stderr:
-            logger.debug(f"KLV extraction stderr: {result.stderr[:1000]}")
-        
-        if result.returncode != 0:
-            # Parse output to check if it's just "no KLV found" vs actual error
-            output = result.stderr or result.stdout or ''
-            
-            if 'No KLV metadata found' in output or '✗ No KLV metadata found' in output:
-                logger.info(f"No KLV metadata found in: {video_file}")
-                return jsonify({
-                    'success': False,
-                    'error': 'No KLV metadata found in video file. This file may not contain embedded STANAG 4609 KLV data.',
-                    'details': 'KLV metadata is typically found in MPEG-TS (.ts) files recorded from drone streams. MOV/MP4 files may not contain KLV unless specifically encoded with it.'
-                }), 404
-            
-            error_msg = output
-            logger.error(f"KLV extraction failed (returncode={result.returncode}): {error_msg[:500]}")
-            return jsonify({
-                'success': False,
-                'error': 'KLV extraction failed. The video file may be corrupted or in an unsupported format.'
-            }), 500
-        
-        # Load the extracted JSON
-        if json_file.exists():
+
+        # 1) Demux the data (KLV) track to a temp file. A feed without MISB 0601
+        #    metadata (e.g. a synthetic test pattern) has no data stream, so ffmpeg
+        #    writes nothing / exits non-zero -- an expected "no KLV" outcome, not an error.
+        temp_klv = tempfile.NamedTemporaryFile(delete=False, suffix='.bin')
+        temp_klv.close()
+        try:
+            result = subprocess.run(
+                ['ffmpeg', '-i', video_file, '-map', '0:d', '-c', 'copy',
+                 '-f', 'data', '-y', temp_klv.name],
+                capture_output=True, text=True, timeout=120,
+            )
+            has_stream = result.returncode == 0 and os.path.getsize(temp_klv.name) > 0
+            klv_bytes = b''
+            if has_stream:
+                with open(temp_klv.name, 'rb') as fh:
+                    klv_bytes = fh.read()
+        finally:
+            try:
+                os.unlink(temp_klv.name)
+            except OSError:
+                pass
+
+        # 2) No data track at all -> no KLV present (expected for non-UAS feeds).
+        no_klv = {
+            'success': False,
+            'error': 'No KLV metadata found in video file. This file may not contain embedded STANAG 4609 KLV data.',
+            'details': 'KLV metadata is typically found in MPEG-TS (.ts) files recorded from drone streams. MOV/MP4 files may not contain KLV unless specifically encoded with it.'
+        }
+        if not has_stream:
+            # Log ffmpeg's stderr so a genuinely corrupt/unreadable file (vs a valid feed
+            # that simply has no data track) stays diagnosable, even though both map to the
+            # same "no KLV" 404 for the operator.
+            logger.info("No KLV data stream in %s (ffmpeg rc=%s): %s", video_file,
+                        result.returncode, (result.stderr or '').strip()[-500:])
+            return jsonify(no_klv), 404
+
+        # 3) Frame + decode packets (shared single source of truth in shared.klv).
+        packets = parse_klv_packets(klv_bytes)
+        if not packets:
+            logger.info(f"KLV data stream present but no decodable packets in: {video_file}")
+            return jsonify(no_klv), 404
+
+        # 4) Shape for the UI and cache the JSON next to the video so repeat calls hit
+        #    the fast 'cached' path above.
+        klv_data = _shape_klv_result(packets, video_path, include_raw)
+        try:
             import json as json_lib
-            with open(json_file, 'r') as f:
-                klv_data = json_lib.load(f)
-            
-            total_packets = klv_data.get('extraction_info', {}).get('total_packets', 0)
-            logger.info(f"KLV extraction successful: {total_packets} packets")
-            
-            return jsonify({
-                'success': True,
-                'message': 'KLV extracted successfully',
-                'data': klv_data,
-                'cached': False,
-                'total_packets': total_packets
-            })
-        else:
-            return jsonify({
-                'success': False,
-                'error': 'Extraction completed but JSON file not found'
-            }), 500
+            with open(json_file, 'w') as f:
+                json_lib.dump(klv_data, f, indent=2, default=str)
+        except OSError as e:
+            logger.warning(f"Could not cache KLV extraction to {json_file}: {e}")
+
+        total_packets = klv_data['extraction_info']['total_packets']
+        logger.info(f"KLV extraction successful: {total_packets} packets")
+        return jsonify({
+            'success': True,
+            'message': 'KLV extracted successfully',
+            'data': klv_data,
+            'cached': False,
+            'total_packets': total_packets
+        })
         
     except subprocess.TimeoutExpired:
         logger.error(f"KLV extraction timeout for: {video_file}")

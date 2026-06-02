@@ -698,11 +698,13 @@ class UnifiedKLVParser:
         tags.append(b'\x03' + bytes([len(mission_id)]) + mission_id)
         
         # Platform latitude (tag 13) - example: 40.7128° N (NYC)
-        lat_raw = int(40.7128 * (2**31) / 180.0)
+        # MISB ST 0601: latitude range ±90 maps to the full int32 (±(2^31-1)).
+        lat_raw = int(40.7128 * (2**31 - 1) / 90.0)
         tags.append(b'\x0d\x04' + struct.pack('>i', lat_raw))
-        
+
         # Platform longitude (tag 14) - example: -74.0060° W (NYC)
-        lon_raw = int(-74.0060 * (2**31) / 180.0)
+        # MISB ST 0601: longitude range ±180 maps to the full int32 (±(2^31-1)).
+        lon_raw = int(-74.0060 * (2**31 - 1) / 180.0)
         tags.append(b'\x0e\x04' + struct.pack('>i', lon_raw))
         
         # Platform altitude (tag 15) - example: 1000 feet
@@ -799,6 +801,68 @@ class UnifiedKLVParser:
         except KeyboardInterrupt:
             print("\nShutting down KLV parser...")
 
+
+def parse_klv_packets(klv_data: bytes) -> list:
+    """Frame STANAG 4609 / MISB ST 0601 packets from a raw KLV byte stream and decode each.
+
+    Splits the stream on the 16-byte UAS Datalink Local Set universal key followed by a
+    BER length, then decodes every complete packet with :class:`UnifiedKLVParser`. Returns
+    a list of parsed-packet dicts (each as produced by ``parse_klv_packet``); the list is
+    empty when the stream contains no valid packet. This is the single source of truth for
+    KLV framing, shared by the ``/api/klv/extract`` endpoint and the ``utils/read_klv.py``
+    CLI so the logic never drifts between them.
+    """
+    parser = UnifiedKLVParser()
+    packets = []
+
+    # STANAG 4609 universal key (start of each UAS Local Set packet).
+    stanag_key = bytes([0x06, 0x0E, 0x2B, 0x34, 0x02, 0x0B, 0x01, 0x01,
+                        0x0E, 0x01, 0x03, 0x01, 0x01, 0x00, 0x00, 0x00])
+
+    offset = 0
+    while offset < len(klv_data):
+        # Look for the next key; skip any non-KLV bytes between packets.
+        if klv_data[offset:offset + 16] != stanag_key:
+            next_key = klv_data.find(stanag_key, offset + 1)
+            if next_key == -1:
+                break
+            offset = next_key
+            continue
+
+        try:
+            # Parse the BER length immediately after the 16-byte key.
+            if offset + 16 >= len(klv_data):
+                break
+
+            length_byte = klv_data[offset + 16]
+            if length_byte < 128:
+                length_size = 1
+                data_len = length_byte
+            else:
+                length_bytes = length_byte & 0x7F
+                length_size = 1 + length_bytes
+                data_len = 0
+                for i in range(length_bytes):
+                    if offset + 17 + i >= len(klv_data):
+                        break
+                    data_len = (data_len << 8) | klv_data[offset + 17 + i]
+
+            packet_size = 16 + length_size + data_len
+
+            if offset + packet_size > len(klv_data):
+                break
+
+            packets.append(parser.parse_klv_packet(klv_data[offset:offset + packet_size]))
+            offset += packet_size
+
+        except Exception:
+            # Corrupt/implausible packet — advance one byte and resync on the next key.
+            offset += 1
+            continue
+
+    return packets
+
+
 def encode_uas_metadata(metadata: Dict[str, Any]) -> bytes:
     """
     Encode UAS metadata into STANAG 4609 KLV format
@@ -845,15 +909,15 @@ def encode_uas_metadata(metadata: Dict[str, Any]) -> bytes:
     # Sensor Latitude (tag 13) - degrees, IMAPB encoding
     if 'sensor_latitude' in metadata:
         lat = float(metadata['sensor_latitude'])
-        # MISB ST 0601: Map -90/+90 to -(2^31-1)/(2^31-1)
-        lat_raw = int(lat * (2**31) / 180.0)
+        # MISB ST 0601: latitude range ±90 maps to the full int32 (±(2^31-1)).
+        lat_raw = int(lat * (2**31 - 1) / 90.0)
         tags.append(b'\x0d\x04' + struct.pack('>i', lat_raw))
-    
+
     # Sensor Longitude (tag 14) - degrees, IMAPB encoding
     if 'sensor_longitude' in metadata:
         lon = float(metadata['sensor_longitude'])
-        # MISB ST 0601: Map -180/+180 to -(2^31-1)/(2^31-1)
-        lon_raw = int(lon * (2**31) / 180.0)
+        # MISB ST 0601: longitude range ±180 maps to the full int32 (±(2^31-1)).
+        lon_raw = int(lon * (2**31 - 1) / 180.0)
         tags.append(b'\x0e\x04' + struct.pack('>i', lon_raw))
     
     # Sensor True Altitude (tag 15) - meters, IMAPB encoding
@@ -868,13 +932,15 @@ def encode_uas_metadata(metadata: Dict[str, Any]) -> bytes:
     # Frame Center Latitude (tag 23) - degrees, IMAPB encoding
     if 'frame_center_latitude' in metadata:
         lat = float(metadata['frame_center_latitude'])
-        lat_raw = int(lat * (2**31) / 180.0)
+        # MISB ST 0601: latitude range ±90 maps to the full int32 (±(2^31-1)).
+        lat_raw = int(lat * (2**31 - 1) / 90.0)
         tags.append(b'\x17\x04' + struct.pack('>i', lat_raw))
-    
+
     # Frame Center Longitude (tag 24) - degrees, IMAPB encoding
     if 'frame_center_longitude' in metadata:
         lon = float(metadata['frame_center_longitude'])
-        lon_raw = int(lon * (2**31) / 180.0)
+        # MISB ST 0601: longitude range ±180 maps to the full int32 (±(2^31-1)).
+        lon_raw = int(lon * (2**31 - 1) / 180.0)
         tags.append(b'\x18\x04' + struct.pack('>i', lon_raw))
     
     # Frame Center Elevation (tag 25) - meters, IMAPB encoding

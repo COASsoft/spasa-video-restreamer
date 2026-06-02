@@ -22,7 +22,7 @@ from pathlib import Path
 # Add shared directory to path for KLV import
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'shared'))
 try:
-    from klv import UnifiedKLVParser
+    from klv import parse_klv_packets
     KLV_AVAILABLE = True
 except ImportError:
     KLV_AVAILABLE = False
@@ -97,68 +97,15 @@ def read_klv_file(klv_file_path, is_temp=False):
     file_size = os.path.getsize(klv_file_path)
     print(f"Size: {file_size:,} bytes\n")
     
-    parser = UnifiedKLVParser()
-    packets = []
-    
     try:
         with open(klv_file_path, 'rb') as f:
             klv_data = f.read()
-        
-        # STANAG 4609 universal key
-        stanag_key = bytes([0x06, 0x0E, 0x2B, 0x34, 0x02, 0x0B, 0x01, 0x01,
-                           0x0E, 0x01, 0x03, 0x01, 0x01, 0x00, 0x00, 0x00])
-        
-        offset = 0
-        packet_num = 0
-        
-        while offset < len(klv_data):
-            # Look for STANAG key
-            if klv_data[offset:offset+16] != stanag_key:
-                # Try to find next key
-                next_key = klv_data.find(stanag_key, offset + 1)
-                if next_key == -1:
-                    break
-                offset = next_key
-                continue
-            
-            try:
-                # Parse BER length
-                if offset + 16 >= len(klv_data):
-                    break
-                    
-                length_byte = klv_data[offset + 16]
-                if length_byte < 128:
-                    length_size = 1
-                    data_len = length_byte
-                else:
-                    length_bytes = length_byte & 0x7F
-                    length_size = 1 + length_bytes
-                    data_len = 0
-                    for i in range(length_bytes):
-                        if offset + 17 + i >= len(klv_data):
-                            break
-                        data_len = (data_len << 8) | klv_data[offset + 17 + i]
-                
-                packet_size = 16 + length_size + data_len
-                
-                if offset + packet_size > len(klv_data):
-                    break
-                
-                # Parse packet
-                packet_data = klv_data[offset:offset + packet_size]
-                parsed = parser.parse_klv_packet(packet_data)
-                packets.append(parsed)
-                packet_num += 1
-                
-                offset += packet_size
-                
-            except Exception as e:
-                offset += 1
-                continue
-    
     except Exception as e:
         print(f"Error reading file: {e}")
         return None
+
+    # Framing/decoding lives in shared.klv.parse_klv_packets (single source of truth).
+    packets = parse_klv_packets(klv_data)
     
     print(f"Total Packets: {len(packets)}\n")
     
