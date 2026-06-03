@@ -41,7 +41,10 @@ _DVR_DIR = os.environ.get('DVR_DIR', '/opt/app/data/dvr')
 _SEG_SECONDS = int(os.environ.get('DVR_SEGMENT_SECONDS', '2'))
 _WINDOW_SECONDS = int(os.environ.get('DVR_WINDOW_SECONDS', '240'))
 _SEG_WRAP = max(2, _WINDOW_SECONDS // max(1, _SEG_SECONDS))
-_RW_TIMEOUT_US = '10000000'  # 10 s input timeout so a dead RTSP socket can't hang
+# 10 s input timeout so a dead RTSP socket can't hang. Uses ffmpeg's `-timeout`
+# (the option the recordings path uses and this build accepts); `-rw_timeout` is
+# rejected as "Option not found" by some ffmpeg builds for the RTSP demuxer.
+_INPUT_TIMEOUT_US = '10000000'
 # No fresh segment data for this long (after startup grace) means ffmpeg is alive but
 # producing nothing — supervise() restarts it. Floored at 20 s so a long source GOP
 # (sparse keyframes → infrequent segment cuts) is never mistaken for a stall.
@@ -128,7 +131,7 @@ class _DvrRecorder:
         url = f"{_MEDIAMTX_RTSP_URL.rstrip('/')}/{self.name}"
         out = os.path.join(self.seg_dir, 'seg%05d.ts')
         cmd = [
-            'ffmpeg', '-rtsp_transport', 'tcp', '-rw_timeout', _RW_TIMEOUT_US, '-i', url,
+            'ffmpeg', '-rtsp_transport', 'tcp', '-timeout', _INPUT_TIMEOUT_US, '-i', url,
             '-map', '0', '-c', 'copy', '-f', 'segment',
             '-segment_time', str(_SEG_SECONDS), '-segment_wrap', str(_SEG_WRAP),
             '-segment_format', 'mpegts', '-reset_timestamps', '1', out,
@@ -198,11 +201,18 @@ class _DvrRecorder:
         }
 
     def recent_segments(self, seconds):
-        """Returns the most recent .ts segments (oldest→newest) covering `seconds`."""
+        """Returns the most recent COMPLETE .ts segments (oldest→newest) covering `seconds`.
+
+        Always drops the newest segment because ffmpeg is still writing it — concatenating
+        a partial/in-progress .ts makes the clip ffmpeg fail (returncode != 0, surfaced as
+        an opaque 500). So a clip needs at least one *complete* segment; until a second
+        segment exists the buffer reads as empty and the clip endpoint returns a clean
+        "still filling" 409 instead of crashing the concat.
+        """
         entries = self._segments()
-        # Exclude the segment ffmpeg is currently writing (newest, may be partial).
-        if len(entries) >= 2:
-            entries = entries[:-1]
+        # Drop the currently-writing newest segment unconditionally (was: only when >= 2,
+        # which let a lone partial segment through and failed the concat).
+        entries = entries[:-1]
         count = max(1, (seconds + _SEG_SECONDS - 1) // _SEG_SECONDS + 1)
         return [path for _, path in entries[-count:]]
 

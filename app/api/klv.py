@@ -40,9 +40,11 @@ _IDLE_TIMEOUT_S = 60      # stop the reader if nobody polls for this long
 _STALE_MS = 5000          # a sample older than this is reported present=false
 _MAX_BUF = 1_000_000      # cap the framing buffer
 _MAX_PACKET = 256_000     # sane upper bound on one KLV packet (resync past garbage)
-# ffmpeg input read/write timeout (microseconds) so a silent-but-open RTSP socket
-# cannot block the reader thread forever (defeating idle-stop / shutdown).
-_RW_TIMEOUT_US = '10000000'  # 10 s
+# ffmpeg input timeout (microseconds) so a silent-but-open RTSP socket cannot block
+# the reader thread forever (defeating idle-stop / shutdown). Uses `-timeout` (the
+# option the recordings path uses and this ffmpeg build accepts); `-rw_timeout` is
+# rejected as "Option not found" by some builds for the RTSP demuxer.
+_INPUT_TIMEOUT_US = '10000000'  # 10 s
 _MAX_READERS = 64         # global cap on concurrent KLV reader processes
 
 _readers = {}
@@ -69,7 +71,7 @@ class _KlvReader:
     def _run(self):
         url = f"{_MEDIAMTX_RTSP_URL.rstrip('/')}/{self.name}"
         cmd = [
-            'ffmpeg', '-rtsp_transport', 'tcp', '-rw_timeout', _RW_TIMEOUT_US,
+            'ffmpeg', '-rtsp_transport', 'tcp', '-timeout', _INPUT_TIMEOUT_US,
             '-i', url, '-map', '0:d', '-c', 'copy', '-f', 'data', '-',
         ]
         while not self._stop.is_set() and not self._idle():

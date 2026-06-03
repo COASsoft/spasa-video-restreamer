@@ -59,6 +59,9 @@ temp/
 #generated HLS output
 data/hls/
 
+#DVR ring-buffer segments (instant-replay clips, generated at runtime)
+data/dvr/
+
 #TLS certificates
 data/certs/
 
