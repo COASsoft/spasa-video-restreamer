@@ -35,8 +35,15 @@ Professional TAK video restreaming server built with Flask, MediaMTX, and FFmpeg
 - **ABR HLS Streaming** — Adaptive bitrate with configurable renditions
 - **HLS CORS Proxy** — Embed streams in external web apps (VideoJS, etc.)
 - **RTSPS (TLS)** — Encrypted RTSP on port 8555 with in-app certificate management
+- **WebRTC / WHEP** — Sub-second-latency browser playback (opt-in)
 - **Stream Standby** — Persistent stream state after publisher disconnect
 - **Docker HEALTHCHECK** — Built-in container health monitoring
+
+> 📚 **Task-oriented guides live in [`docs/`](docs/README.md)**: architecture,
+> protocols & ports, the [WebRTC/WHEP](docs/webrtc-whep.md) deep dive,
+> [SPASA integration](docs/spasa-integration.md), configuration, deployment and
+> troubleshooting. This README and [`FEATURE-MAP.md`](FEATURE-MAP.md) remain the
+> exhaustive reference.
 
 ----
 
