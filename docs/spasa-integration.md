@@ -19,7 +19,9 @@ boundary and the wiring you configure on the SPASA side.
    SPASA Server  ──(control: REST over the nginx mTLS edge)──►  restreamer
    • feeds / groups / CoT          • pull source → relay
    • stamps FeedV2.url             • ABR, recording
-   • KLV → CoT (SPI/footprint)     • KLV latest sample
+   • KLV → CoT (SPI/footprint)     • KLV + VMTI latest sample
+   • VMTI → C2 tracks              • ST 0102 security marking (in KLV)
+   • ONVIF camera onboarding       • ONVIF LAN discovery
    • reconcile loop (feeds ⇄ streams)
 ```
 
@@ -73,7 +75,13 @@ SPASA drives the sidecar through a small slice of the REST API (full inventory i
   `GET /hls/<name>/master.m3u8` for the master playlist.
 - **KLV latest** — `GET /api/streams/<name>/klv/latest` returns the decoded STANAG
   4609 / MISB 0601 sample (sensor lat/lon/alt, frame-center, heading, FOV, slant
-  range, footprint corners) for SPASA to turn into CoT.
+  range, footprint corners) for SPASA to turn into CoT. The sample now also carries a
+  **`security`** object (decoded MISB ST 0102, see below).
+- **VMTI latest** — `GET /api/streams/<name>/vmti/latest` returns the live VMTI
+  (MISB ST 0903) moving-target detections SPASA ingests as C2 tracks. Rides the same
+  ST 0601 stream and **shares the per-stream KLV reader** (no extra FFmpeg per stream).
+- **ONVIF discover** — `GET /api/onvif/discover` lists ONVIF cameras found on the LAN
+  (with resolved RTSP URLs) for SPASA's `POST /restreamer/onvif/add` onboarding.
 - **Health** — used by the reconcile loop and the SPASA admin `/c2/health`-style
   surfacing.
 
@@ -83,6 +91,58 @@ With `klv_cot = true`, SPASA polls `…/klv/latest` once per reconcile cycle and
 broadcasts SPI / sensor / footprint CoT to the feed's groups — so the whole team
 sees where a sensor is looking without opening the video. Markers expire
 `klv_stale_secs` after KLV stops. Lower `reconcile_interval_secs` for snappier SPI.
+
+## VMTI → C2 tracks
+
+VMTI (MISB ST 0903) rides the **same** UAS Datalink (ST 0601) stream as KLV — it is a
+nested Local Set in tag 74 — so SPASA reads it from `…/vmti/latest` without a second
+relay or a second FFmpeg (the endpoint reuses the per-stream KLV reader). Each entry is
+a moving-target detection with an **absolute** geo position:
+
+```json
+{"streamName": "drone1", "present": true, "ageMs": 380,
+ "targets": [{"targetId": 1, "lat": 38.82, "lon": -77.02, "haeM": 110.0,
+              "confidence": 88, "priority": 2}]}
+```
+
+SPASA materializes **one C2 track per target** (reusing the track-bridge funnel — no
+V1/V3/V8 duplication). Targets without a resolvable absolute Target Location are dropped
+on the sidecar side (a track needs lat/lon); pixel-only centroids are deferred and simply
+don't appear, so the consumer degrades cleanly.
+
+## Classification marking (MISB ST 0102)
+
+When the source embeds an ST 0102 Security Metadata Local Set (nested in ST 0601 tag 48),
+`…/klv/latest` surfaces it as a `security` object:
+
+```json
+"security": {"classification": "SECRET", "classifyingCountry": "//US",
+             "releasability": ["USA", "ESP"]}
+```
+
+`classification` is one of `UNCLASSIFIED | RESTRICTED | CONFIDENTIAL | SECRET |
+TOP SECRET`. SPASA stamps this onto the feed's classification. The parse is **fail-soft**:
+when no usable marking is present (absent/empty/truncated) the field is `null`, and SPASA
+leaves the feed's existing classification untouched rather than downgrading it on a signal
+glitch. This surfaces the *signal* only — per-feed access **enforcement** is delegated to
+SPASA's GroupVector and remains a deferred hardening phase (see
+[`DEFERRED-HARDENING.md`](DEFERRED-HARDENING.md) Fase 5).
+
+## ONVIF camera onboarding
+
+`GET /api/onvif/discover` runs a WS-Discovery multicast probe on the sidecar's LAN and
+returns the ONVIF cameras it finds, each with a best-effort resolved RTSP URL, in the flat
+shape SPASA's `POST /restreamer/onvif/add` consumes:
+
+```json
+[{"name": "Front Gate Cam", "rtspUrl": "rtsp://192.168.1.50:554/Profile_1",
+  "profile": "Profile_1"}]
+```
+
+A camera whose RTSP URL can't be resolved (e.g. it requires auth) is still listed with an
+empty `rtspUrl` so the operator can fill it in before adding; a LAN with no ONVIF cameras
+yields `[]`. Discovery is LAN-scoped — the sidecar must share an L2 segment with the
+cameras (the multicast probe doesn't cross routers).
 
 ## The reconcile loop
 

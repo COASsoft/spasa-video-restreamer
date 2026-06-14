@@ -17,6 +17,7 @@ Read access is viewer-gated by the app's fail-closed RBAC default (a GET on an
 unlisted ``/api/`` route requires viewer); no explicit rule is needed.
 """
 
+import binascii
 import math
 import os
 import subprocess
@@ -26,7 +27,12 @@ import time
 from flask import Blueprint, jsonify
 
 from shared.klv import UnifiedKLVParser
+from shared.security import parse_security_ls
 from app.utils.validation import is_valid_stream_name
+
+# ST 0601 tag 48 carries the nested ST 0102 Security Local Set; the KLV parser stores its
+# raw bytes (hex) under this decoded-tag name (W3-T4).
+_SECURITY_TAG_NAME = 'Security Local Set'
 
 klv_bp = Blueprint('klv', __name__)
 
@@ -208,6 +214,18 @@ def _corners(tags, fc_lat, fc_lon):
     return None
 
 
+def _security(tags):
+    """Decodes the ST 0102 security marking (ST 0601 tag 48), or ``None`` if absent."""
+    entry = tags.get(_SECURITY_TAG_NAME)
+    raw_hex = entry.get('raw_value') if entry else None
+    if not isinstance(raw_hex, str):
+        return None
+    try:
+        return parse_security_ls(binascii.unhexlify(raw_hex))
+    except (binascii.Error, ValueError):
+        return None
+
+
 def _normalize(tags, name, age_ms):
     fc_lat = _num(tags, 'Frame Center Latitude')
     fc_lon = _num(tags, 'Frame Center Longitude')
@@ -215,6 +233,7 @@ def _normalize(tags, name, age_ms):
         'streamName': name,
         'present': True,
         'ageMs': age_ms,
+        'security': _security(tags),
         'sensorLat': _num(tags, 'Sensor Latitude'),
         'sensorLon': _num(tags, 'Sensor Longitude'),
         'sensorAltM': _num(tags, 'Sensor True Altitude'),

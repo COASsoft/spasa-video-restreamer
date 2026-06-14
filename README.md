@@ -32,6 +32,8 @@ Professional TAK video restreaming server built with Flask, MediaMTX, and FFmpeg
 
 **Key highlights:**
 - **Authentication & Security** — Session login, API keys, rate limiting, audit logging
+- **Live MISB metadata for SPASA** — KLV (ST 0601), VMTI moving targets (ST 0903) and security marking (ST 0102), decoded off the live relay
+- **ONVIF camera discovery** — WS-Discovery LAN scan with RTSP-URL resolution for onboarding
 - **ABR HLS Streaming** — Adaptive bitrate with configurable renditions
 - **HLS CORS Proxy** — Embed streams in external web apps (VideoJS, etc.)
 - **RTSPS (TLS)** — Encrypted RTSP on port 8555 with in-app certificate management
@@ -164,6 +166,25 @@ curl --cert nginx/pki/viewer.crt --key nginx/pki/viewer.key --cacert nginx/pki/c
 - NaN/Infinity sanitization for valid JSON output
 - Auto-cleanup of intermediate files
 - Web UI and REST API for extraction
+
+### Live SPASA Metadata & ONVIF Discovery
+
+Read-only endpoints that feed the SPASA Server's C2 pipeline directly off the live relay
+(full contracts in [`FEATURE-MAP.md`](FEATURE-MAP.md) §24):
+
+- **Live KLV** — `GET /api/streams/<name>/klv/latest` decodes the latest MISB ST 0601
+  sample (sensor/frame-center/FOV/footprint) from a per-stream background FFmpeg reader.
+- **VMTI moving targets (MISB ST 0903)** — `GET /api/streams/<name>/vmti/latest` decodes
+  the VMTI Local Set nested in ST 0601 tag 74 into per-target absolute lat/lon/HAE
+  detections (SPASA materializes one C2 track per target). **Reuses the same KLV reader** —
+  no extra FFmpeg per stream.
+- **Security marking (MISB ST 0102)** — the live KLV sample now carries a `security` object
+  (`classification`, `classifyingCountry`, `releasability`) decoded from ST 0601 tag 48.
+  Fail-soft: no marking ⇒ `null` (never a downgrade). The signal only — enforcement stays
+  with SPASA (see `docs/DEFERRED-HARDENING.md` Fase 5).
+- **ONVIF discovery** — `GET /api/onvif/discover` runs a WS-Discovery LAN probe and resolves
+  each camera's RTSP URL via ONVIF Media, returning the flat list SPASA's ONVIF onboarding
+  consumes.
 
 ### Recording with Re-encoding
 - Auto-detects H.264/H.265 codecs
@@ -2943,7 +2964,10 @@ services:
 │   │   ├── test.py       # Test pattern generation
 │   │   ├── hls.py        # ABR HLS transcoding & CORS proxy
 │   │   ├── auth_api.py   # Authentication, API keys, audit log
-│   │   └── tls_api.py    # TLS certificate management
+│   │   ├── tls_api.py    # TLS certificate management
+│   │   ├── klv.py        # Live KLV (ST 0601) latest-sample endpoint (incl. ST 0102 security)
+│   │   ├── vmti.py       # Live VMTI (ST 0903) moving-target endpoint (shares the KLV reader)
+│   │   └── onvif.py      # ONVIF WS-Discovery endpoint for SPASA onboarding
 │   ├── auth.py           # Flask-Login setup, credentials, API key management
 │   ├── services/         # Business logic services
 │   │   ├── abr.py        # ABR HLS transcoding service
@@ -2958,6 +2982,9 @@ services:
 │       └── broadcast.py  # Real-time event broadcasting
 ├── shared/               # Shared libraries
 │   ├── klv.py           # MISB ST 0601.19 KLV parser
+│   ├── vmti.py          # MISB ST 0903 VMTI (moving-target) parser (pure)
+│   ├── security.py      # MISB ST 0102 security-marking parser (pure)
+│   ├── onvif.py         # ONVIF WS-Discovery / Media SOAP build & parse (pure)
 │   └── srt_buffer.py    # SRT stream buffering
 ├── utils/               # Standalone utilities
 │   ├── read_klv.py           # KLV reading utility

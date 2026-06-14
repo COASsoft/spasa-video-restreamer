@@ -30,6 +30,7 @@ Intended as a porting reference.
 21. [Utility Modules](#21-utility-modules)
 22. [External Process Management (FFmpeg)](#22-external-process-management-ffmpeg)
 23. [Security Model](#23-security-model)
+24. [REST API — SPASA Live Metadata & ONVIF Discovery](#24-rest-api--spasa-live-metadata--onvif-discovery)
 
 ---
 
@@ -361,6 +362,10 @@ File transcoding and KLV metadata extraction endpoints in `app.api.utils`.
 
 **WebSocket events:** `transcode_complete` (on success or failure, with `success` flag), `transcode_cancelled`.
 
+> **Live vs file KLV:** the endpoints above extract KLV from *recorded files*. The
+> *live* relay samples SPASA polls (`/api/streams/<name>/klv/latest`,
+> `…/vmti/latest`) and ONVIF discovery are documented in [§24](#24-rest-api--spasa-live-metadata--onvif-discovery).
+
 ---
 
 ## 15. WebSocket Events
@@ -623,6 +628,90 @@ Flask spawns FFmpeg child processes for five use cases:
 | Rate limiting | Flask-Limiter on login endpoint: 5 requests per minute per IP (optional — degrades gracefully if `flask-limiter` not installed) |
 | TLS | RTSPS on port 8555; cert managed in `data/certs/`; key stored chmod 600 |
 | Secret key | Must be set via env var for persistent sessions; random fallback with warning |
+
+---
+
+## 24. REST API — SPASA Live Metadata & ONVIF Discovery
+
+Read-only endpoints that feed the SPASA Server's C2 pipeline directly: live KLV / VMTI
+samples decoded off the relay, plus LAN camera discovery for onboarding. All are
+**viewer-gated by the fail-closed RBAC default** (a `GET` on an unlisted `/api/` route
+requires the viewer role) — no explicit auth rule is registered for them.
+
+| Method | Path | Blueprint | Description |
+|---|---|---|---|
+| `GET` | `/api/streams/<name>/klv/latest` | `app/api/klv.py` | Latest decoded live STANAG 4609 / MISB ST 0601 sample off the relay. Spawns/reuses a per-stream background FFmpeg KLV reader. |
+| `GET` | `/api/streams/<name>/vmti/latest` | `app/api/vmti.py` | Latest decoded live VMTI (MISB ST 0903) moving-target detections. **Shares the same per-stream KLV reader** — one FFmpeg serves both `/klv/latest` and `/vmti/latest`. |
+| `GET` | `/api/onvif/discover` | `app/api/onvif.py` | Discover ONVIF cameras on the LAN via WS-Discovery and resolve each one's RTSP URL via ONVIF Media. Best-effort, bounded (~3 s probe). |
+
+### `/api/streams/<name>/klv/latest`
+
+Normalized flat sample (parser `shared/klv.py`) that SPASA turns into SPI / sensor /
+footprint CoT:
+
+```json
+{
+  "streamName": "drone1",
+  "present": true,
+  "ageMs": 420,
+  "security": {"classification": "SECRET", "classifyingCountry": "//US", "releasability": ["USA", "ESP"]},
+  "sensorLat": 38.8, "sensorLon": -77.0, "sensorAltM": 1500.0,
+  "frameCenterLat": 38.81, "frameCenterLon": -77.01, "frameCenterElevM": 95.0,
+  "platformHeadingDeg": 270.0, "sensorRelAzDeg": 12.0, "sensorRelElDeg": -8.0,
+  "hfovDeg": 4.0, "vfovDeg": 2.3, "slantRangeM": 5200.0,
+  "corners": [[38.80,-77.02],[38.82,-77.02],[38.82,-77.00],[38.80,-77.00]]
+}
+```
+
+- **`security`** — decoded MISB **ST 0102** Security Metadata Local Set (carried nested in
+  ST 0601 **tag 48**), parsed by `shared/security.py`:
+  `{classification, classifyingCountry, releasability[]}` where `classification` ∈
+  `UNCLASSIFIED | RESTRICTED | CONFIDENTIAL | SECRET | TOP SECRET`. It is `null` when no
+  usable marking is present (empty/truncated/missing level) — **fail-soft**, so SPASA
+  leaves the feed's classification untouched on a signal glitch rather than downgrading it.
+- Returns `{present: false}` (HTTP 200) when there is no reader sample yet or the sample
+  is older than the staleness window; HTTP **503** when the global KLV-reader cap is reached.
+
+### `/api/streams/<name>/vmti/latest`
+
+One entry per moving-target detection with an **absolute** geo position (parser
+`shared/vmti.py`); SPASA ingests these as C2 tracks (one track per target, reusing the
+track-bridge funnel):
+
+```json
+{
+  "streamName": "drone1",
+  "present": true,
+  "ageMs": 380,
+  "targets": [
+    {"targetId": 1, "lat": 38.82, "lon": -77.02, "haeM": 110.0, "confidence": 88, "priority": 2}
+  ]
+}
+```
+
+- Decodes the **VTarget Series** (ST 0903 tag 101); per target extracts **Target Location**
+  (VTarget tag 17 — absolute lat/lon/HAE), **Target Priority** (tag 4) and **Target
+  Confidence** (tag 5). Targets without a resolvable absolute location are dropped (SPASA
+  needs lat/lon to materialize a track; pixel-only centroids are deferred).
+- `present` is `true` only when at least one target decoded.
+
+### `/api/onvif/discover`
+
+Flat list (SOAP helpers `shared/onvif.py`) the SPASA Server's ONVIF onboarding
+(`POST /restreamer/onvif/add`) consumes:
+
+```json
+[
+  {"name": "Front Gate Cam", "rtspUrl": "rtsp://192.168.1.50:554/Profile_1", "profile": "Profile_1"}
+]
+```
+
+- WS-Discovery multicast probe (`239.255.255.250:3702`) for `NetworkVideoTransmitter`
+  devices, then **anonymous** ONVIF Media `GetProfiles` / `GetStreamUri` to resolve the
+  RTSP URL.
+- Degrades cleanly: a camera whose RTSP URL can't be resolved (e.g. it requires auth) is
+  still listed with `rtspUrl: ""` (the operator fills it in before adding); a LAN with no
+  ONVIF cameras yields `[]`, never an error.
 
 ## License
 

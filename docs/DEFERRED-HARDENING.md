@@ -71,6 +71,16 @@ need-to-know coexist on the node.** The deciding question:
 **Effort.** Live-view: low on the restreamer side (mostly the SPASA integration hook).
 Recording labels/retention: medium.
 
+**Status (partial — the *signal* is in place).** The restreamer now **decodes** the MISB
+**ST 0102** security marking embedded in the source (nested in ST 0601 tag 48) and surfaces
+it on `GET /api/streams/<name>/klv/latest` as a `security` object
+(`classification`, `classifyingCountry`, `releasability` — parser `shared/security.py`).
+That gives SPASA a per-feed classification *label* to stamp. What remains deferred is the
+**enforcement**: mandatory access control / per-feed live-view gating (delegate to SPASA's
+GroupVector + the HMAC-signed HLS URLs, as above) and recording labels + retention/crypto-
+erase at rest. Decoding the marking ≠ enforcing it — keep `CERT_DEFAULT_ROLE` fail-closed
+until the GroupVector hook is wired.
+
 ---
 
 ## Fase 3 — SQLite control-plane + multi-worker + MediaMTX hooks

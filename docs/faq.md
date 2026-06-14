@@ -51,6 +51,30 @@ frame center, FOV, footprint). The sidecar decodes the latest sample at
 `GET /api/streams/<name>/klv/latest`; SPASA turns it into SPI / sensor / footprint
 CoT so the team sees where a sensor is looking without opening the video.
 
+### What's VMTI and how does SPASA use it?
+
+VMTI (MISB ST 0903) is moving-target indicator metadata carried in the *same* ST 0601
+stream as KLV (nested in tag 74). `GET /api/streams/<name>/vmti/latest` returns the
+decoded targets — each with an absolute lat/lon — and SPASA materializes one C2 track per
+target. Because it rides the same stream, it reuses the per-stream KLV reader: no extra
+FFmpeg, no second relay. See [SPASA integration](spasa-integration.md).
+
+### Does the sidecar handle classification markings?
+
+It *decodes* them. If the source embeds a MISB ST 0102 security marking (nested in ST 0601
+tag 48), `…/klv/latest` surfaces a `security` object (`classification`,
+`classifyingCountry`, `releasability`) that SPASA stamps onto the feed. The parse is
+fail-soft (no marking ⇒ `null`, never a downgrade). This is the *signal* only — per-feed
+access **enforcement** stays with SPASA's GroupVector and is a deferred hardening phase
+(see [`DEFERRED-HARDENING.md`](DEFERRED-HARDENING.md) Fase 5).
+
+### How do I find ONVIF cameras on the network?
+
+`GET /api/onvif/discover` runs a WS-Discovery probe on the sidecar's LAN and returns the
+ONVIF cameras it finds with resolved RTSP URLs, in the shape SPASA's ONVIF onboarding
+consumes. It's LAN-scoped (the multicast probe doesn't cross routers) and best-effort: a
+camera that needs auth is listed with an empty `rtspUrl` for the operator to complete.
+
 ### Where's the exhaustive reference?
 
 [`README.md`](../README.md) (features + walkthrough) and

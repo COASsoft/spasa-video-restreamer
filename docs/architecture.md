@@ -19,7 +19,7 @@ nothing in the data plane makes access decisions.
    │     • recording  → data/streams/<name>/*.mov               │
    │     • ABR HLS     → data/hls/<name>/v<n>/*.ts              │
    │     • pull streams (ingest external source → relay)        │
-   │     • KLV demux  → latest MISB 0601 sample (cached)        │
+   │     • KLV/VMTI demux → latest ST 0601 sample (cached)      │
    └──────────────────────────────────────────────────────────┘
         ▲                                   ▲
         │ control (REST :3000 + WebSocket)  │ HLS segments (offloaded)
@@ -40,7 +40,9 @@ nothing in the data plane makes access decisions.
 | **MediaMTX** (Go binary) | Multi-protocol ingest + relay engine (RTSP/RTSPS/SRT/RTMP/HLS/WebRTC). Its management API listens on `127.0.0.1:8889` (loopback, never published). | Data |
 | **FFmpeg** (system binary) | Recording, ABR transcoding, pull-stream ingest, synthetic test patterns, and KLV data-track demux. One subprocess per task. | Data |
 | **nginx** (hardened mode only) | TLS termination + client mTLS at `:443`; forwards the app and native HLS over a private `edge` network; serves HLS segments via `X-Accel-Redirect`. | Edge |
-| **KLV reader** (`shared.klv`, optional) | Background per-stream FFmpeg demux of the STANAG 4609 / MISB 0601 data track; decodes and caches the latest sample for SPASA. | Data |
+| **KLV reader** (`shared.klv`, optional) | Background per-stream FFmpeg demux of the STANAG 4609 / MISB 0601 data track; decodes and caches the latest sample for SPASA. One reader per stream serves both `/klv/latest` and `/vmti/latest`. | Data |
+| **VMTI / ST 0102 decoders** (`shared.vmti`, `shared.security`) | Pure (no I/O) parsers for the nested Local Sets carried in the ST 0601 stream: VMTI moving targets (ST 0903, tag 74 → `/vmti/latest`) and the security marking (ST 0102, tag 48 → the `security` field of `/klv/latest`). | Data |
+| **ONVIF discovery** (`shared.onvif` + `app/api/onvif.py`) | WS-Discovery LAN probe + ONVIF Media RTSP-URL resolution; lists cameras for SPASA onboarding (`/api/onvif/discover`). SOAP build/parse is pure; only the socket/HTTP glue does I/O. | Data |
 
 ## Control plane vs data plane
 
