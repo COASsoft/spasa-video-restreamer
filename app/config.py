@@ -181,6 +181,36 @@ CERT_DEFAULT_ROLE = os.environ.get('CERT_DEFAULT_ROLE') or None
 API_KEY_DEFAULT_ROLE = os.environ.get('API_KEY_DEFAULT_ROLE', 'viewer')
 
 # ---------------------------------------------------------------------------
+# Ingest authorization delegated to SPASA (SPASA SPEC-01 camino B / SPEC-08 gap D)
+# ---------------------------------------------------------------------------
+# When MediaMTX runs with `authMethod: http` it POSTs every publish/read attempt
+# to `authHTTPAddress`. Pointing it at this app's `/auth/mediamtx` lets SPASA make
+# the decision with its own users and groups, instead of authorizing by IP range
+# (VPN_CIDR) — so an authorized device can publish from 4G or a new WiFi with no
+# edit on the server, and revoking access takes effect on the very next attempt.
+#
+# MediaMTX cannot add headers to that POST, which is why the app proxies it: the
+# shared secret and the TLS trust store live here, not in mediamtx.yml.
+#
+# UNSET (default) = the proxy route refuses everything and MediaMTX should stay on
+# `authMethod: internal`. Nothing about an existing deployment changes.
+SPASA_INGEST_AUTH_URL = os.environ.get('SPASA_INGEST_AUTH_URL', '')
+# Shared secret sent as X-SPASA-Ingest-Token. Must match the value SPASA resolves
+# from `[video_restreamer] ingest_auth_token_env`.
+SPASA_VIDEO_INGEST_TOKEN = os.environ.get('SPASA_VIDEO_INGEST_TOKEN', '')
+# Per-request timeout (seconds) talking to SPASA. Kept short: MediaMTX holds the
+# publisher's handshake open while this call is in flight.
+SPASA_INGEST_AUTH_TIMEOUT = _env_int('SPASA_INGEST_AUTH_TIMEOUT', 3, minimum=1, maximum=30)
+# CA bundle verifying SPASA's TLS. Empty = use the system store. Set to the
+# deployment's ca.crt when SPASA serves a private-CA certificate.
+SPASA_INGEST_AUTH_CA = os.environ.get('SPASA_INGEST_AUTH_CA', '')
+# What to do when SPASA is unreachable (down, network partition). Default False =
+# FAIL CLOSED: nobody publishes while SPASA is unreachable. This is the tradeoff
+# the JWT path (camino A) would have avoided, and it is a deliberate, documented
+# choice — set to true only if continuity of ingest outweighs authorization.
+SPASA_INGEST_FAIL_OPEN = _env_bool('SPASA_INGEST_FAIL_OPEN', False)
+
+# ---------------------------------------------------------------------------
 # HLS access control (Phase 1 infra "B")
 # ---------------------------------------------------------------------------
 # When True, HLS playback is fail-closed: each HLS view requires either an

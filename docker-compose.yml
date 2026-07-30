@@ -93,6 +93,20 @@ services:
       # (authInternalUsers[2]) injected via MediaMTX's MTX_ env overrides.
       - MTX_AUTHINTERNALUSERS_0_PASS=${MEDIAMTX_API_PASS:-mediamtx-change-me}
       - MTX_AUTHINTERNALUSERS_2_IPS=${VPN_CIDR:-10.0.0.0/8}
+      # --- Ingest authorization delegated to SPASA (opt-in; see mediaMTX.yml) ---
+      # Empty by default = `authMethod: internal`, i.e. exactly today's behaviour.
+      # Set BOTH of these to switch: MediaMTX then asks SPASA on every attempt, so a
+      # device publishes from any network without editing VPN_CIDR, and revoking a
+      # user takes effect on the next attempt instead of at token expiry.
+      - MTX_AUTHMETHOD=${MTX_AUTHMETHOD:-internal}
+      - MTX_AUTHHTTPADDRESS=${MTX_AUTHHTTPADDRESS:-}
+      # App → SPASA leg of that hook (the app adds the shared secret; MediaMTX cannot).
+      - SPASA_INGEST_AUTH_URL=${SPASA_INGEST_AUTH_URL:-}
+      - SPASA_VIDEO_INGEST_TOKEN=${SPASA_VIDEO_INGEST_TOKEN:-}
+      - SPASA_INGEST_AUTH_CA=${SPASA_INGEST_AUTH_CA:-}
+      # false = nobody publishes while SPASA is unreachable (fail closed). Flip only
+      # if continuity of ingest matters more than authorization.
+      - SPASA_INGEST_FAIL_OPEN=${SPASA_INGEST_FAIL_OPEN:-false}
       # Optional: auto-generate self-signed RTSPS certs / HTTPS for the app itself
       # - AUTO_GENERATE_CERTS=true
       # - ENABLE_GPU_ENCODING=1

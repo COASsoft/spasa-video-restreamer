@@ -29,6 +29,37 @@ udpMaxPayloadSize: 1452
 #   MTX_AUTHINTERNALUSERS_0_PASS  == MEDIAMTX_API_PASS   (control API password)
 #   MTX_AUTHINTERNALUSERS_2_IPS   == VPN_CIDR            (e.g. 10.0.0.0/8)
 # The placeholder password below is an obvious "change me" default; override it.
+#
+# ── Option B: delegate authorization to SPASA (`authMethod: http`) ──────────────
+# Entry [2] above is the weak point of this model: publishing is authorized by
+# NETWORK ADDRESS, which is spoofable and which the operator must re-edit every time
+# the topology changes. A device on 4G or on a new WiFi just gets 401.
+#
+# Switching to `http` makes MediaMTX ask SPASA on EVERY attempt, so authorization
+# becomes "does your SPASA user have access to this feed?" and revoking is immediate
+# (no token TTL to wait out). Turn it on with the MTX_ overrides in docker-compose:
+#
+#   MTX_AUTHMETHOD=http
+#   MTX_AUTHHTTPADDRESS=http://127.0.0.1:3000/auth/mediamtx
+#
+# `authHTTPAddress` points at THIS container's app, not at SPASA directly: MediaMTX
+# cannot add headers to the hook request, and the shared secret, the TLS trust store
+# and the "what if SPASA is down" decision all belong to the app
+# (`app/api/ingest_auth.py`). It then needs, in the app's environment:
+#
+#   SPASA_INGEST_AUTH_URL=https://<spasa-host>:8443/video/ingest-auth
+#   SPASA_VIDEO_INGEST_TOKEN=<same secret SPASA resolves from ingest_auth_token_env>
+#
+# What the app answers, so nothing that works today stops working:
+#   - api/metrics/pprof and the in-container publish/read (app, ffmpeg, ABR) keep
+#     working from loopback with no credentials — same as entries [0] and [1];
+#   - a remote publisher must present a SPASA user that can already SEE the feed,
+#     so the feed has to exist in SPASA before emitting;
+#   - a remote RTSP attempt with no credentials is refused ON PURPOSE, which is what
+#     makes MediaMTX issue the challenge; the client then retries WITH credentials.
+#
+# `internal` stays a valid, supported mode and is the committed default: no existing
+# deployment changes unless the operator opts in.
 authMethod: internal
 authInternalUsers:
   - user: control

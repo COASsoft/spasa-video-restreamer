@@ -22,7 +22,7 @@ from app.config import (SECRET_KEY, PORT, CORS_ORIGINS, LOG_LEVEL, LOGS_DIR, LOG
                         LOG_BACKUP_COUNT, LOG_JSON, validate_runtime_config)
 
 # Import blueprints
-from app.api import health_bp, streams_bp, recordings_bp, settings_bp, utils_bp, test_bp, hls_bp, auth_bp, tls_bp, metrics_bp, klv_bp, vmti_bp, onvif_bp, dvr_bp
+from app.api import health_bp, streams_bp, recordings_bp, settings_bp, utils_bp, test_bp, hls_bp, auth_bp, tls_bp, metrics_bp, klv_bp, vmti_bp, onvif_bp, dvr_bp, ingest_auth_bp
 
 # Import websocket handlers
 from app.websocket import set_socketio, register_handlers
@@ -168,6 +168,11 @@ def create_app():
     app.register_blueprint(vmti_bp)
     app.register_blueprint(onvif_bp)
     app.register_blueprint(dvr_bp)
+    # POST /auth/mediamtx — hook de autorización de ingesta que MediaMTX consulta
+    # con `authMethod: http` y que este proxy reenvía a SPASA. Va fuera de /api
+    # a propósito: MediaMTX no tiene identidad en esta app, y la ruta se protege
+    # por loopback + el secreto compartido con SPASA (ver app/api/ingest_auth.py).
+    app.register_blueprint(ingest_auth_bp)
 
     # Apply rate limiting to login endpoint
     if app.limiter:

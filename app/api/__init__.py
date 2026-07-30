@@ -21,9 +21,10 @@ from .klv import klv_bp
 from .vmti import vmti_bp
 from .onvif import onvif_bp
 from .dvr import dvr_bp
+from .ingest_auth import ingest_auth_bp
 
 __all__ = [
     'health_bp', 'streams_bp', 'recordings_bp', 'settings_bp',
     'utils_bp', 'test_bp', 'hls_bp', 'auth_bp', 'tls_bp', 'metrics_bp',
-    'klv_bp', 'vmti_bp', 'onvif_bp', 'dvr_bp',
+    'klv_bp', 'vmti_bp', 'onvif_bp', 'dvr_bp', 'ingest_auth_bp',
 ]
